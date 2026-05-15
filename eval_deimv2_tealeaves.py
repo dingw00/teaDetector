@@ -8,6 +8,8 @@ IoU 阈值列表来自 onnx_eval_config.MAP_IOU_THRESHOLDS。该口径与训练�
 用法示例：
     python eval_deimv2_tealeaves.py --checkpoint E:\\teaDetector\\outputs\\deimv2_s_tealeaves\\final
     python eval_deimv2_tealeaves.py --checkpoint ... --conf 0.1 --nms 0.3 --batch_size 4
+
+默认对 train、val 均计算指标并各抽取 vis_num 张图可视化；若只需 val 请加 --val_only。
 """
 
 from __future__ import annotations
@@ -30,6 +32,40 @@ from transformers import AutoImageProcessor, Deimv2ForObjectDetection
 import onnx_eval_config as cfg
 
 
+def parse_args():
+    root = Path(__file__).resolve().parent
+    p = argparse.ArgumentParser(description="DEIMv2 (HF) 茶叶模型评测，指标对齐 eval_onnx_detector")
+    p.add_argument(
+        "--checkpoint",
+        type=Path,
+        default=root / "outputs" / "deimv2_s_tealeaves" / "final",
+        help="save_pretrained 目录（含 config.json、模型权重与 preprocessor）",
+    )
+    p.add_argument(
+        "--dataset",
+        type=Path,
+        default=root / "datasets" / "TeaLeavesDatasets_split_lr",
+    )
+    p.add_argument("--train_ann", type=Path, default=None, help="默认 dataset/annotations/train.json")
+    p.add_argument("--val_ann", type=Path, default=None, help="默认 dataset/annotations/val.json")
+    p.add_argument("--output_dir", type=Path, default=root / "outputs" / "deimv2_hf_eval")
+    p.add_argument("--conf", type=float, default=0.05, help="score 阈值（与训练验证 map_score_threshold 默认一致）")
+    p.add_argument("--nms", type=float, default=cfg.NMS_THRESHOLD, help="按类 NMS IoU 阈值，与 ONNX 脚本后处理一致")
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=0)
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--vis_num", type=int, default=cfg.VIS_NUM_IMAGES)
+    p.add_argument("--seed", type=int, default=cfg.RANDOM_SEED)
+    p.add_argument("--run_name", type=str, default=None)
+    p.add_argument(
+        "--val_only",
+        action="store_true",
+        help="仅评测 val（不读 train、不算 train 指标、不做 train 可视化）；默认 train+val 都评测",
+    )
+    return p.parse_args()
+
+
+
 @dataclass
 class CocoDataset:
     name: str
@@ -37,6 +73,9 @@ class CocoDataset:
     image_dir: Path
     images: list[dict]
     gt_by_image: dict[int, list[dict]]
+    """用于 AP 等指标：与常见 COCO 评测一致，不含 iscrowd。"""
+    gt_by_image_vis: dict[int, list[dict]]
+    """仅用于可视化：凡标注里 bbox 面积>0 的实例都画（含 iscrowd）。"""
     category_names: dict[int, str]
 
 
@@ -46,18 +85,25 @@ def load_coco(name: str, ann_path: Path, image_dir: Path) -> CocoDataset:
 
     category_names = {cat["id"]: cat.get("name", str(cat["id"])) for cat in coco.get("categories", [])}
     gt_by_image = {img["id"]: [] for img in coco["images"]}
+    gt_by_image_vis = {img["id"]: [] for img in coco["images"]}
 
     for ann in coco.get("annotations", []):
-        x, y, w, h = ann["bbox"]
-        if w <= 0 or h <= 0 or ann.get("iscrowd", 0):
+        bbox = ann.get("bbox")
+        if not bbox or len(bbox) < 4:
             continue
-        gt_by_image.setdefault(ann["image_id"], []).append(
-            {
-                "bbox": [float(x), float(y), float(x + w), float(y + h)],
-                "category_id": ann["category_id"],
-                "matched": False,
-            }
-        )
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            continue
+        xyxy = [float(x), float(y), float(x + w), float(y + h)]
+        cid = ann["category_id"]
+        crowd = bool(ann.get("iscrowd", 0))
+        iid = ann["image_id"]
+
+        gt_by_image_vis.setdefault(iid, []).append({"bbox": xyxy, "category_id": cid, "iscrowd": crowd})
+
+        if crowd:
+            continue
+        gt_by_image.setdefault(iid, []).append({"bbox": xyxy, "category_id": cid, "matched": False})
 
     return CocoDataset(
         name=name,
@@ -65,6 +111,7 @@ def load_coco(name: str, ann_path: Path, image_dir: Path) -> CocoDataset:
         image_dir=image_dir,
         images=coco["images"],
         gt_by_image=gt_by_image,
+        gt_by_image_vis=gt_by_image_vis,
         category_names=category_names,
     )
 
@@ -202,15 +249,17 @@ def compute_map(preds_by_image, dataset: CocoDataset):
 
 
 def draw_boxes(image_bgr, preds, gts, category_names, save_path: Path):
+    """先画 GT（标签在框上方），再画预测（标签在框下方），线宽一致。"""
     image = image_bgr.copy()
 
     for gt in gts:
         x1, y1, x2, y2 = [int(round(v)) for v in gt["bbox"]]
         name = category_names.get(gt["category_id"], str(gt["category_id"]))
+        suffix = " [crowd]" if gt.get("iscrowd") else ""
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 220, 0), 2)
         cv2.putText(
             image,
-            f"GT:{name}",
+            f"GT:{name}{suffix}",
             (x1, max(15, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -290,40 +339,11 @@ def collate_batch(batch):
     return list(images), torch.stack(target_sizes, dim=0), list(image_ids)
 
 
-def parse_args():
-    root = Path(__file__).resolve().parent
-    p = argparse.ArgumentParser(description="DEIMv2 (HF) 茶叶模型评测，指标对齐 eval_onnx_detector")
-    p.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=root / "outputs" / "deimv2_s_tealeaves" / "final",
-        help="save_pretrained 目录（含 config.json、模型权重与 preprocessor）",
-    )
-    p.add_argument(
-        "--data_root",
-        type=Path,
-        default=root / "datasets" / "TeaLeavesDatasets_split_lr",
-    )
-    p.add_argument("--train_ann", type=Path, default=None, help="默认 data_root/annotations/train.json")
-    p.add_argument("--val_ann", type=Path, default=None, help="默认 data_root/annotations/val.json")
-    p.add_argument("--output_dir", type=Path, default=root / "outputs" / "deimv2_hf_eval")
-    p.add_argument("--conf", type=float, default=0.05, help="score 阈值（与训练验证 map_score_threshold 默认一致）")
-    p.add_argument("--nms", type=float, default=cfg.NMS_THRESHOLD, help="按类 NMS IoU 阈值，与 ONNX 脚本后处理一致")
-    p.add_argument("--batch_size", type=int, default=2)
-    p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--vis_num", type=int, default=cfg.VIS_NUM_IMAGES)
-    p.add_argument("--seed", type=int, default=cfg.RANDOM_SEED)
-    p.add_argument("--run_name", type=str, default=None)
-    p.add_argument("--eval_train", action="store_true", help="同时评测 train.json（默认只评 val）")
-    return p.parse_args()
-
-
 def build_run_name(args, model_stem: str) -> str:
     if args.run_name:
         return make_safe_name(args.run_name)
 
-    dataset_name = make_safe_name(args.data_root.name)
+    dataset_name = make_safe_name(args.dataset.name)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"{timestamp}_{model_stem}_{dataset_name}_conf{args.conf:g}_nms{args.nms:g}"
 
@@ -385,7 +405,7 @@ def evaluate_dataset(
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
         preds = preds_by_image.get(img_info["id"], [])
-        gts = dataset.gt_by_image.get(img_info["id"], [])
+        gts = dataset.gt_by_image_vis.get(img_info["id"], [])
         save_name = f"{Path(img_info['file_name']).stem}_pred_gt.jpg"
         draw_boxes(image_bgr, preds, gts, dataset.category_names, vis_dir / save_name)
 
@@ -394,8 +414,8 @@ def evaluate_dataset(
 
 def main():
     args = parse_args()
-    train_ann = args.train_ann or (args.data_root / "annotations" / "train.json")
-    val_ann = args.val_ann or (args.data_root / "annotations" / "val.json")
+    train_ann = args.train_ann or (args.dataset / "annotations" / "train.json")
+    val_ann = args.val_ann or (args.dataset / "annotations" / "val.json")
 
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"找不到 checkpoint 目录：{args.checkpoint}")
@@ -406,9 +426,14 @@ def main():
     model.to(device)
     model.eval()
 
-    image_dir = args.data_root
+    image_dir = args.dataset
     val_set = load_coco("val", val_ann, image_dir)
-    train_set = load_coco("train", train_ann, image_dir) if args.eval_train else None
+    train_set = None
+    if not args.val_only:
+        if not train_ann.exists():
+            print(f"警告: 未找到 train 标注 {train_ann}，跳过 train 评测（仅 val）。")
+        else:
+            train_set = load_coco("train", train_ann, image_dir)
 
     model_stem = make_safe_name(args.checkpoint.name)
     run_name = build_run_name(args, model_stem)
@@ -471,7 +496,7 @@ def main():
             "path": str(args.checkpoint),
         },
         "dataset": {
-            "name": args.data_root.name,
+            "name": args.dataset.name,
             "image_dir": str(image_dir),
             "train_ann": str(train_ann),
             "val_ann": str(val_ann),

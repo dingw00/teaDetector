@@ -6,17 +6,17 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent
 
 # 模型和数据集
-ONNX_MODEL_PATH = ROOT_DIR / "onnx" / "dino_0329_30.onnx"
-DATASET_ROOT = ROOT_DIR / "datasets" / "teabud_dataset_ztu"
+ONNX_MODEL_PATH = ROOT_DIR / "onnx_models" / "dino_0329_30.onnx"
+DATASET_ROOT = ROOT_DIR / "datasets" / "TeaLeavesDatasets_split_lr"
 IMAGE_DIR = DATASET_ROOT / "images"
-TRAIN_ANN = DATASET_ROOT / "annotations" / "train_30.json"
-VAL_ANN = DATASET_ROOT / "annotations" / "val_30_30.json"
+TRAIN_ANN = DATASET_ROOT / "annotations" / "train.json"
+VAL_ANN = DATASET_ROOT / "annotations" / "val.json"
 
 # 与 C++ 推理代码一致：输入固定为 input_size x input_size
 INPUT_SIZE = 640
 
 # 后处理阈值
-CONF_THRESHOLD = 0.1
+CONF_THRESHOLD = 0.2
 NMS_THRESHOLD = 0.3
 
 # 指标和可视化

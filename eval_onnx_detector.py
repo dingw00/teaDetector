@@ -38,6 +38,9 @@ class CocoDataset:
     image_dir: Path
     images: list[dict]
     gt_by_image: dict[int, list[dict]]
+    """用于 AP：不含 iscrowd。"""
+    gt_by_image_vis: dict[int, list[dict]]
+    """可视化：凡 bbox 面积>0 的标注都画（含 iscrowd）。"""
     category_names: dict[int, str]
 
 
@@ -67,14 +70,27 @@ def load_coco(name: str, ann_path: Path, image_dir: Path) -> CocoDataset:
     category_names = {cat["id"]: cat.get("name", str(cat["id"]))
                       for cat in coco.get("categories", [])}
     gt_by_image = {img["id"]: [] for img in coco["images"]}
+    gt_by_image_vis = {img["id"]: [] for img in coco["images"]}
 
     for ann in coco.get("annotations", []):
-        x, y, w, h = ann["bbox"]
-        if w <= 0 or h <= 0 or ann.get("iscrowd", 0):
+        bbox = ann.get("bbox")
+        if not bbox or len(bbox) < 4:
             continue
-        gt_by_image.setdefault(ann["image_id"], []).append({
-            "bbox": [float(x), float(y), float(x + w), float(y + h)],
-            "category_id": ann["category_id"],
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            continue
+        xyxy = [float(x), float(y), float(x + w), float(y + h)]
+        cid = ann["category_id"]
+        crowd = bool(ann.get("iscrowd", 0))
+        iid = ann["image_id"]
+
+        gt_by_image_vis.setdefault(iid, []).append({"bbox": xyxy, "category_id": cid, "iscrowd": crowd})
+
+        if crowd:
+            continue
+        gt_by_image.setdefault(iid, []).append({
+            "bbox": xyxy,
+            "category_id": cid,
             "matched": False,
         })
 
@@ -84,6 +100,7 @@ def load_coco(name: str, ann_path: Path, image_dir: Path) -> CocoDataset:
         image_dir=image_dir,
         images=coco["images"],
         gt_by_image=gt_by_image,
+        gt_by_image_vis=gt_by_image_vis,
         category_names=category_names,
     )
 
@@ -305,13 +322,15 @@ def compute_map(preds_by_image, dataset: CocoDataset):
 
 
 def draw_boxes(image_bgr, preds, gts, category_names, save_path: Path):
+    """先画 GT（标签在框上沿），再画预测（标签在框下沿），线宽一致。"""
     image = image_bgr.copy()
 
     for gt in gts:
         x1, y1, x2, y2 = [int(round(v)) for v in gt["bbox"]]
         name = category_names.get(gt["category_id"], str(gt["category_id"]))
+        suffix = " [crowd]" if gt.get("iscrowd") else ""
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 220, 0), 2)
-        cv2.putText(image, f"GT:{name}", (x1, max(15, y1 - 6)),
+        cv2.putText(image, f"GT:{name}{suffix}", (x1, max(15, y1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1, cv2.LINE_AA)
 
     for pred in preds:
@@ -357,7 +376,7 @@ def evaluate_dataset(session, dataset: CocoDataset, input_size: int, conf: float
         image_path = resolve_image_path(dataset.image_dir, img_info["file_name"])
         image_bgr = cv2.imread(str(image_path))
         preds = preds_by_image.get(img_info["id"], [])
-        gts = dataset.gt_by_image.get(img_info["id"], [])
+        gts = dataset.gt_by_image_vis.get(img_info["id"], [])
 
         # print(f"  image_id={img_info['id']} file={img_info['file_name']}")
         # print(f"    GT boxes({len(gts)}):")

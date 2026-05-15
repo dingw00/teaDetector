@@ -1,0 +1,6 @@
+.venv/
+/datasets/
+/outputs/
+/onnx_models/
+*__pycache__/
+test.ipynb
