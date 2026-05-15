@@ -1,0 +1,27 @@
+# PyTorch：若需 CUDA，请按官方说明选择对应版本安装，避免与 torchvision 版本错配
+# https://pytorch.org/get-started/locally/
+torch>=2.4.0
+torchvision>=0.19.0
+
+# Hugging Face DEIMv2（Deimv2ForObjectDetection / AutoImageProcessor）
+transformers>=4.51.0
+
+# 训练脚本说明中的 Hungarian 等；部分检测头实现亦会间接依赖
+scipy>=1.10.0
+
+# COCO 标注与 mAP（train_deimv2_s_tealeaves.py）
+pycocotools>=2.0.7
+
+# 图像读写（训练 / 切分 / 评测）
+Pillow>=10.0.0
+
+# 评测与 ONNX 脚本（eval_deimv2_tealeaves.py / eval_onnx_detector.py）
+opencv-python>=4.8.0
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# ONNXRuntime 推理（eval_onnx_detector.py）；GPU 环境可改为 onnxruntime-gpu
+onnxruntime>=1.16.0
+
+# 训练曲线（plot_training_curves.py）
+matplotlib>=3.7.0
