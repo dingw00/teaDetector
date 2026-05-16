@@ -15,12 +15,12 @@ pycocotools>=2.0.7
 # 图像读写（训练 / 切分 / 评测）
 Pillow>=10.0.0
 
-# 评测与 ONNX 脚本（eval_deimv2_tealeaves.py / eval_onnx_detector.py）
+# 评测（eval_tea.py：ONNX / HF checkpoint）
 opencv-python>=4.8.0
 numpy>=1.24.0
 tqdm>=4.65.0
 
-# ONNXRuntime 推理（eval_onnx_detector.py）；GPU 环境可改为 onnxruntime-gpu
+# ONNXRuntime 推理（eval_tea.py --backend onnx）；GPU 环境可改为 onnxruntime-gpu
 onnxruntime>=1.16.0
 
 # 训练曲线（plot_training_curves.py）
