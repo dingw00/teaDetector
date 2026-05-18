@@ -9,7 +9,7 @@
 | 2 | 原图：水平翻转 + ColorJitter（原 simple） |
 | 3 | detection 流水线，概率×0.5、光度幅度×0.5 |
 | 4 | detection 流水线，概率×0.75、光度幅度×0.75 |
-| 5 | detection 全强度 + 训练集可选四宫格 Mosaic（默认 p=0.3） |
+| 5 | detection 全强度（含 RandomPhotometricDistort 色彩）+ 可选 Mosaic（见 configs/augmentation.py） |
 
 旧名：none→1，simple/normal/flip→2，detection_lite→3，detection/detector→5。
 """
@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import sys
+from collections import defaultdict
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field
 from io import StringIO
@@ -69,7 +70,7 @@ LEVEL_SUMMARY: dict[int, str] = {
     2: f"原图分辨率：水平翻转 + ColorJitter（{SIMPLE_COLOR_JITTER}）",
     3: "detection 流水线（概率与光度幅度均为等级 5 的 50%），无 Mosaic",
     4: "detection 流水线（概率与光度幅度均为等级 5 的 75%），无 Mosaic",
-    5: "detection 全强度 + 训练集可选四宫格 Mosaic（默认 p=0.3，见 configs/train.AUG_DET_MOSAIC_P）",
+    5: "detection 全强度（RandomPhotometricDistort 光度/色彩）+ 可选 Mosaic（见 configs/augmentation.py）",
 }
 
 DETECTION_PIPELINE_FIXED = (
@@ -331,6 +332,104 @@ def _default_coco_train_val_paths(root: Path) -> tuple[Path, Path]:
     raise FileNotFoundError(
         f"在 {ann} 下未找到 train.json+val.json 或 instances_train.json+instances_val.json（数据集根: {root}）"
     )
+
+
+@dataclass(frozen=True)
+class DatasetCategorySpec:
+    """由 --datasets 下各集 train 标注汇总得到的检测类别。"""
+
+    num_labels: int
+    id2label: dict[int, str]
+    label2id: dict[str, int]
+    coco_id_to_label: dict[int, int]
+    label_to_coco_id: dict[int, int]
+
+
+def config_num_labels(config) -> int:
+    nl = getattr(config, "num_labels", None)
+    if nl is not None:
+        return int(nl)
+    id2label = getattr(config, "id2label", None) or {}
+    return len(id2label)
+
+
+def resolve_categories_from_dataset_roots(roots: list[Path]) -> DatasetCategorySpec:
+    """
+    扫描 --datasets 下各集 train 标注，合并全部类别（按 COCO category_id 去重），
+    num_labels = 类别集合大小；训练时将 category_id 映射为连续 label 0..num_labels-1，
+    mAP 评测时再映射回 COCO category_id。
+    """
+    if not roots:
+        raise ValueError("resolve_categories_from_dataset_roots 需要至少一个数据集根目录")
+
+    categories_meta: dict[int, str] = {}
+    ann_cat_ids: set[int] = set()
+
+    for root in roots:
+        root = root.resolve()
+        train_p, _ = _default_coco_train_val_paths(root)
+        with open(train_p, encoding="utf-8") as f:
+            coco = json.load(f)
+        for cat in coco.get("categories", []):
+            cid = int(cat["id"])
+            name = str(cat.get("name", cid))
+            if cid in categories_meta and categories_meta[cid] != name:
+                print(
+                    f"警告: category_id={cid} 在数据集 {root.name} 中名称与先前不一致："
+                    f"{categories_meta[cid]!r} vs {name!r}，保留先出现的名称。"
+                )
+            categories_meta.setdefault(cid, name)
+        for ann in coco.get("annotations", []):
+            ann_cat_ids.add(int(ann["category_id"]))
+
+    if ann_cat_ids:
+        missing = ann_cat_ids - set(categories_meta)
+        for cid in sorted(missing):
+            categories_meta[cid] = str(cid)
+            print(
+                f"警告: category_id={cid} 出现在 train 标注中但 categories 未定义，"
+                f"使用占位名称 {cid!r}。"
+            )
+
+    if not categories_meta:
+        roots_s = ", ".join(str(r) for r in roots)
+        raise ValueError(f"在以下数据集的 train 标注中未找到任何类别: {roots_s}")
+
+    all_class_ids = set(categories_meta.keys())
+    sorted_coco_ids = sorted(all_class_ids)
+    num_labels = len(all_class_ids)
+    coco_id_to_label = {cid: i for i, cid in enumerate(sorted_coco_ids)}
+    label_to_coco_id = {i: cid for cid, i in coco_id_to_label.items()}
+    id2label = {i: categories_meta[cid] for i, cid in enumerate(sorted_coco_ids)}
+    label2id = {name: i for i, name in id2label.items()}
+
+    return DatasetCategorySpec(
+        num_labels=num_labels,
+        id2label=id2label,
+        label2id=label2id,
+        coco_id_to_label=coco_id_to_label,
+        label_to_coco_id=label_to_coco_id,
+    )
+
+
+def _remap_target_category_ids(target: list, category_id_remap: dict[int, int]) -> list:
+    if not category_id_remap:
+        return target
+    out: list = []
+    for ann in target:
+        a = dict(ann)
+        raw_cid = a["category_id"]
+        if isinstance(raw_cid, torch.Tensor):
+            cid = int(raw_cid.item())
+        else:
+            cid = int(raw_cid)
+        if cid not in category_id_remap:
+            raise ValueError(
+                f"标注 category_id={cid} 不在类别表内，已知 COCO id: {sorted(category_id_remap)}"
+            )
+        a["category_id"] = category_id_remap[cid]
+        out.append(a)
+    return out
 
 
 def _abs_image_file_name(root: Path, file_name: str) -> str:
@@ -761,10 +860,15 @@ class TeaCocoDataset(torch.utils.data.Dataset):
         *,
         mosaic_p: float = 0.0,
         sample_weights: list[float] | None = None,
+        category_id_remap: dict[int, int] | None = None,
     ):
         self._coco = CocoDetection(str(root), str(ann_file))
         self.mosaic_p = float(mosaic_p)
         self.sample_weights = sample_weights
+        self._category_id_remap = category_id_remap or {}
+
+    def _remap_target(self, target: list) -> list:
+        return _remap_target_category_ids(target, self._category_id_remap)
 
     def __len__(self):
         return len(self._coco)
@@ -776,7 +880,7 @@ class TeaCocoDataset(torch.utils.data.Dataset):
         if img.mode != "RGB":
             img = img.convert("RGB")
         image_id = self._coco.ids[idx]
-        return img, image_id, list(target)
+        return img, image_id, self._remap_target(list(target))
 
     def _getitem_mosaic(self, idx: int) -> tuple[Image.Image, int, list]:
         n = len(self._coco)
@@ -793,7 +897,7 @@ class TeaCocoDataset(torch.utils.data.Dataset):
             img, target = self._coco[idx]
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            return img, self._coco.ids[idx], list(target)
+            return img, self._coco.ids[idx], self._remap_target(list(target))
 
         idxs = [idx, others[0], others[1], others[2]]
         quads: list[tuple[Image.Image, list]] = []
@@ -803,7 +907,7 @@ class TeaCocoDataset(torch.utils.data.Dataset):
                 img = img.convert("RGB")
             quads.append((img, list(target)))
         mos_img, mos_tgt = _mosaic_pil_coco_quadrants(quads)
-        return mos_img, self._coco.ids[idx], mos_tgt
+        return mos_img, self._coco.ids[idx], self._remap_target(mos_tgt)
 
 
 # ========================================================================
@@ -1214,6 +1318,8 @@ def evaluate_coco_bbox_map(
     batch_size: int,
     score_threshold: float,
     num_workers: int,
+    *,
+    label_to_coco_id: dict[int, int] | None = None,
 ) -> dict[str, float]:
     model.eval()
     loader = DataLoader(
@@ -1241,10 +1347,19 @@ def evaluate_coco_bbox_map(
             labels = res["labels"]
             boxes = res["boxes"]
             for s, lab, box in zip(scores.tolist(), labels.tolist(), boxes):
+                lab_i = int(lab)
+                if label_to_coco_id is not None:
+                    if lab_i not in label_to_coco_id:
+                        raise ValueError(
+                            f"模型输出 label={lab_i} 不在 [0, {len(label_to_coco_id)}) 内"
+                        )
+                    coco_cid = label_to_coco_id[lab_i]
+                else:
+                    coco_cid = lab_i
                 predictions.append(
                     {
                         "image_id": int(img_id),
-                        "category_id": int(lab),
+                        "category_id": coco_cid,
                         "bbox": _xyxy_to_xywh(box.cpu()),
                         "score": float(s),
                     }
@@ -1252,10 +1367,15 @@ def evaluate_coco_bbox_map(
 
     if not predictions:
         first_id = int(coco_gt.getImgIds()[0])
+        dummy_cid = (
+            next(iter(label_to_coco_id.values()))
+            if label_to_coco_id
+            else 0
+        )
         predictions.append(
             {
                 "image_id": first_id,
-                "category_id": 0,
+                "category_id": dummy_cid,
                 "bbox": [0.0, 0.0, 1.0, 1.0],
                 "score": 1e-5,
             }
@@ -1297,6 +1417,8 @@ def evaluate_val_maps_per_dataset(
     batch_size: int,
     score_threshold: float,
     num_workers: int,
+    *,
+    label_to_coco_id: dict[int, int] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
     """对各数据集 val 分别评测，逐行打印，返回 (per_dataset, mean)。"""
     per_ds: dict[str, dict[str, float]] = {}
@@ -1313,6 +1435,7 @@ def evaluate_val_maps_per_dataset(
             batch_size=batch_size,
             score_threshold=score_threshold,
             num_workers=num_workers,
+            label_to_coco_id=label_to_coco_id,
         )
         per_ds[src.name] = m
         print(
@@ -1520,6 +1643,7 @@ def build_train_val_sources(
     args,
     *,
     script_dir: Path,
+    category_id_remap: dict[int, int] | None = None,
 ) -> tuple[TeaCocoDataset, Path, list[str], Path | None, list[ValEvalSource], list[float] | None]:
     """
     返回 (train_ds, train_ann_path, roots_used, merged_cache_dir_or_None, val_eval_sources, train_weights)。
@@ -1536,7 +1660,9 @@ def build_train_val_sources(
             ValEvalSource(
                 name=root.name,
                 root=root,
-                dataset=TeaCocoDataset(root, val_ann, mosaic_p=0.0),
+                dataset=TeaCocoDataset(
+                    root, val_ann, mosaic_p=0.0, category_id_remap=category_id_remap
+                ),
                 ann_path=val_ann,
             )
         )
@@ -1545,7 +1671,9 @@ def build_train_val_sources(
         if args.dataset_ratios:
             print("提示: 仅 1 个 --datasets 时忽略 --dataset_ratios。")
         train_ann, _ = _default_coco_train_val_paths(roots[0])
-        train_ds = TeaCocoDataset(roots[0], train_ann, mosaic_p=train_mosaic_p)
+        train_ds = TeaCocoDataset(
+            roots[0], train_ann, mosaic_p=train_mosaic_p, category_id_remap=category_id_remap
+        )
         return train_ds, train_ann, [str(roots[0])], None, val_sources, None
 
     fingerprint = hashlib.md5("\n".join(str(r.resolve()) for r in roots).encode("utf-8")).hexdigest()[:16]
@@ -1553,7 +1681,13 @@ def build_train_val_sources(
     train_ann_m, _val_ann_m, train_weights = merge_coco_roots_for_training(
         roots, merged_dir, dataset_ratios=args.dataset_ratios
     )
-    train_ds = TeaCocoDataset(script_dir, train_ann_m, mosaic_p=train_mosaic_p, sample_weights=train_weights)
+    train_ds = TeaCocoDataset(
+        script_dir,
+        train_ann_m,
+        mosaic_p=train_mosaic_p,
+        sample_weights=train_weights,
+        category_id_remap=category_id_remap,
+    )
     return train_ds, train_ann_m, [str(r) for r in roots], merged_dir, val_sources, train_weights
 
 

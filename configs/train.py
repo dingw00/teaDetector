@@ -36,17 +36,8 @@ DEVICE: str | None = None
 MAP_SCORE_THRESHOLD = 0.05
 MAP_BATCH_SIZE: int | None = None
 
-# 数据增强等级 1–5（默认 5 = 原 detection + Mosaic）
+# 数据增强等级 1–5（默认 5 = detection 全强度 + Mosaic）；细项概率默认见 configs/augmentation.py
 AUG_LEVEL = 5
-
-# AUG_SIMPLE_FLIP_P = 0.5
-# AUG_SIMPLE_COLOR_P = 0.8
-# AUG_DET_PHOTOMETRIC_P = 0.7
-# AUG_DET_ZOOMOUT_FILL = 0.0
-# AUG_DET_ZOOMOUT_P = 0.6
-# AUG_DET_IOU_CROP_P = 0.85
-# AUG_DET_FLIP_P = 0.5
-# AUG_DET_MOSAIC_P = 0.3  # 仅 aug_level=5：四宫格 Mosaic 概率
 
 PRESETS: dict[str, dict] = {
     "dinov3_s_march": {

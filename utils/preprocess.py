@@ -8,6 +8,7 @@ from typing import Any
 from transformers import AutoImageProcessor
 
 from configs import preprocess as pc
+from utils.common import as_pretrained_identifier
 
 
 def preprocess_settings_dict() -> dict[str, Any]:
@@ -41,10 +42,11 @@ def _is_local_checkpoint_dir(path: Path) -> bool:
 
 
 def load_deimv2_processor(model_id_or_path: str | Path) -> AutoImageProcessor:
-    path = Path(model_id_or_path)
-    processor = AutoImageProcessor.from_pretrained(str(path))
+    load_target = as_pretrained_identifier(model_id_or_path)
+    processor = AutoImageProcessor.from_pretrained(load_target)
 
-    use_saved = _is_local_checkpoint_dir(path) and pc.USE_CHECKPOINT_PREPROCESSOR
+    local_dir = Path(model_id_or_path) if isinstance(model_id_or_path, Path) else Path(load_target)
+    use_saved = _is_local_checkpoint_dir(local_dir) and pc.USE_CHECKPOINT_PREPROCESSOR
     if use_saved and not pc.FORCE_APPLY_CONFIG:
         return processor
 

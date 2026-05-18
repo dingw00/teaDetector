@@ -35,6 +35,8 @@ checkpoint-best 的基准（若无则从零开始比较）。
 
 多数据集：--datasets 可传一个或多个 COCO 根目录。单个时直接训练；多个时合并 train 用于训练，
 各目录 val 在每轮单独算 mAP 并打印，最后输出各指标平均值。
+检测类别数：合并各集 train 标注中的全部类别（按 category_id 去重），集合大小即 num_labels；
+训练时将 COCO category_id 映射为 0..num_labels-1，mAP 时再映回 COCO id。
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ from transformers import Deimv2ForObjectDetection
 
 from transformers.utils import logging as hf_logging
 
+import configs.augmentation as _aug
 import configs.train as _tc
 from utils.common import HF_DEIMV2_PRESETS, resolve_pretrained_hub_id
 from utils.preprocess import (
@@ -79,8 +82,10 @@ from utils.train import (
     augmentation_metrics_block,
     build_adamw_param_groups,
     build_train_val_sources,
+    config_num_labels,
     evaluate_coco_bbox_map,
     evaluate_val_maps_per_dataset,
+    resolve_categories_from_dataset_roots,
     format_augmentation_log_line,
     make_train_collate_fn,
     move_labels_to_device,
@@ -127,12 +132,30 @@ _TC_ARG_FIELDS: tuple[tuple[str, str], ...] = (
 )
 _PRESET_ARG_NAMES = frozenset(name for name, _ in _TC_ARG_FIELDS)
 
+# configs/train.py 可省略；未定义时从 configs/augmentation.py 读取（与 AUG_LEVEL 配套）
+_AUG_TC_ATTRS = frozenset(
+    tc_attr
+    for arg_name, tc_attr in _TC_ARG_FIELDS
+    if arg_name.startswith("aug_") and arg_name != "aug_level"
+)
+
+
+def _config_value(tc_attr: str) -> object:
+    if hasattr(_tc, tc_attr):
+        return getattr(_tc, tc_attr)
+    if tc_attr in _AUG_TC_ATTRS and hasattr(_aug, tc_attr):
+        return getattr(_aug, tc_attr)
+    raise AttributeError(
+        f"configs.train 与 configs.augmentation 均未定义 {tc_attr!r}；"
+        f"请设置 AUG_LEVEL 或于 configs/augmentation.py 中补充默认值。"
+    )
+
 
 def _training_defaults(preset: str | None) -> dict[str, object]:
     """合并 configs/train.py 顶层默认与 PRESETS[preset]（preset 中的键覆盖顶层）。"""
     cfg: dict[str, object] = {}
     for arg_name, tc_attr in _TC_ARG_FIELDS:
-        val = getattr(_tc, tc_attr)
+        val = _config_value(tc_attr)
         cfg[arg_name] = list(val) if arg_name == "datasets" else val
     if preset is None:
         return cfg
@@ -329,7 +352,7 @@ def parse_args(argv: list[str] | None = None):
         "--aug_det_mosaic_p",
         type=float,
         default=d["aug_det_mosaic_p"],
-        help="仅 aug_level=5 且训练集 len>=4：四宫格 Mosaic 概率，默认 0.3",
+        help="仅 aug_level=5 且训练集 len>=4：四宫格 Mosaic 概率（默认见 configs/augmentation.py）",
     )
     add_preprocess_arguments(p)
     return p.parse_args(argv_rest)
@@ -351,6 +374,15 @@ def main():
     if args.warmup_epochs < 0:
         raise ValueError("--warmup_epochs 不能为负数")
 
+    category_spec = resolve_categories_from_dataset_roots(args.datasets)
+    print(
+        f"检测类别（合并 {len(args.datasets)} 个训练集）: num_labels={category_spec.num_labels}（"
+        f"共 {len(category_spec.coco_id_to_label)} 个 COCO category_id）"
+    )
+    for coco_id in sorted(category_spec.coco_id_to_label):
+        lab = category_spec.coco_id_to_label[coco_id]
+        print(f"  label {lab} ← COCO id={coco_id} {category_spec.id2label[lab]!r}")
+
     start_epoch = 0
     resume_training_state: dict | None = None
     if args.resume_from is not None:
@@ -359,8 +391,12 @@ def main():
             raise FileNotFoundError(f"--resume_from 不是目录: {resume_dir}")
         processor = load_deimv2_processor(resume_dir)
         model = Deimv2ForObjectDetection.from_pretrained(str(resume_dir))
-        model.config.id2label = {0: "I", 1: "Y"}
-        model.config.label2id = {"I": 0, "Y": 1}
+        ckpt_labels = config_num_labels(model.config)
+        if ckpt_labels != category_spec.num_labels:
+            raise ValueError(
+                f"续训 checkpoint 类别数 num_labels={ckpt_labels} 与当前 --datasets 解析结果 "
+                f"{category_spec.num_labels} 不一致；请使用与训练时相同的数据集组合。"
+            )
         ts_path = _load_training_state_path(resume_dir)
         if ts_path is not None:
             resume_training_state = torch.load(ts_path, map_location="cpu", weights_only=False)
@@ -375,11 +411,12 @@ def main():
         print(f"图像预处理: {describe_processor(processor)}  （配置见 configs/preprocess.py）")
         model = Deimv2ForObjectDetection.from_pretrained(
             pretrained_hub,
-            num_labels=2,
+            num_labels=category_spec.num_labels,
             ignore_mismatched_sizes=True,
         )
-        model.config.id2label = {0: "I", 1: "Y"}
-        model.config.label2id = {"I": 0, "Y": 1}
+        model.config.id2label = dict(category_spec.id2label)
+        model.config.label2id = dict(category_spec.label2id)
+        model.config.num_labels = category_spec.num_labels
 
     load_source = str(args.resume_from) if args.resume_from is not None else resolve_pretrained_hub_id(args.pretrained)
 
@@ -401,7 +438,11 @@ def main():
     print("训练数据增强 " + format_augmentation_log_line(aug_record))
 
     train_ds, train_ann, dataset_roots, merged_coco_cache, val_eval_sources, train_sample_weights = (
-        build_train_val_sources(args, script_dir=_SCRIPT_DIR)
+        build_train_val_sources(
+            args,
+            script_dir=_SCRIPT_DIR,
+            category_id_remap=category_spec.coco_id_to_label,
+        )
     )
     print(f"训练数据: {'合并 train' if len(args.datasets) > 1 else '单集'}，共 {len(args.datasets)} 个数据集根目录:")
     for i, r in enumerate(dataset_roots):
@@ -622,6 +663,7 @@ def main():
             batch_size=map_bs,
             score_threshold=args.map_score_threshold,
             num_workers=args.num_workers,
+            label_to_coco_id=category_spec.label_to_coco_id,
         )
         map_val_per, map_val_mean = evaluate_val_maps_per_dataset(
             model,
@@ -631,6 +673,7 @@ def main():
             batch_size=map_bs,
             score_threshold=args.map_score_threshold,
             num_workers=args.num_workers,
+            label_to_coco_id=category_spec.label_to_coco_id,
         )
         map_val = map_val_mean if len(val_eval_sources) > 1 else next(iter(map_val_per.values()))
 
@@ -663,6 +706,9 @@ def main():
             "pretrained": args.pretrained,
             "load_source": load_source,
             "dataset_roots": dataset_roots,
+            "num_labels": category_spec.num_labels,
+            "id2label": {str(k): v for k, v in category_spec.id2label.items()},
+            "coco_id_to_label": {str(k): v for k, v in category_spec.coco_id_to_label.items()},
             "dataset_ratios": list(args.dataset_ratios) if args.dataset_ratios else None,
             "train_sample_weights_enabled": train_sample_weights is not None,
             "merged_coco_cache": str(merged_coco_cache) if merged_coco_cache is not None else None,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 import configs.eval as cfg
+from configs import preprocess as pc
 from utils.common import (
     Backend,
     detect_backend,
@@ -166,6 +167,22 @@ def filter_preds_for_vis(preds_by_image: dict[int, list], image_ids: list[int], 
     return out
 
 
+def preds_for_vis(
+    preds_by_image: dict[int, list],
+    image_ids: list[int],
+    vis_conf: float,
+    nms_thres: float,
+) -> dict[int, list]:
+    """可视化：先 per-class NMS，再按 vis_conf 过滤（mAP 全量推理不做 NMS）。"""
+    out: dict[int, list] = {}
+    for image_id in image_ids:
+        preds = list(preds_by_image.get(image_id, []))
+        if nms_thres < 1.0:
+            preds = postprocess_nms_per_class(preds, nms_thres)
+        out[image_id] = [p for p in preds if float(p["score"]) >= vis_conf]
+    return out
+
+
 def voc_ap(recalls: np.ndarray, precisions: np.ndarray) -> float:
     mrec = np.concatenate(([0.0], recalls, [1.0]))
     mpre = np.concatenate(([0.0], precisions, [0.0]))
@@ -262,7 +279,6 @@ def build_vis_plan(
 ) -> dict[str, dict[str, list[dict]]]:
     """dataset -> split -> [{id, file_name}, ...]，全模型共用。"""
     plan: dict[str, dict[str, list[dict]]] = {}
-    plan: dict[str, dict[str, list[dict]]] = {}
     for spec in specs:
         plan[spec.name] = {}
         if not val_only:
@@ -282,7 +298,7 @@ def build_vis_plan(
             print(f"警告: 未找到 {spec.name} val 标注，跳过 val 可视化抽样。")
     return plan
 
-def draw_boxes(image_bgr, preds, gts, category_names, save_path: Path):
+def render_boxes_bgr(image_bgr, preds, gts, category_names) -> np.ndarray:
     image = image_bgr.copy()
     for gt in gts:
         x1, y1, x2, y2 = [int(round(v)) for v in gt["bbox"]]
@@ -301,8 +317,7 @@ def draw_boxes(image_bgr, preds, gts, category_names, save_path: Path):
             image, f"P:{name} {pred['score']:.2f}", (x1, min(image.shape[0] - 5, y2 + 16)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1, cv2.LINE_AA,
         )
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(save_path), image)
+    return image
 
 
 def vis_group_dir_name(dataset_name: str, split: str) -> str:
@@ -310,12 +325,81 @@ def vis_group_dir_name(dataset_name: str, split: str) -> str:
     return make_safe_name(f"{dataset_name}_{split}")
 
 
+@dataclass
+class VisPanelAccumulator:
+    """内存累积各模型 vis 面板，评测结束后写入 vis/{dataset}_{split}/{image}.jpg。"""
+
+    _panels: dict[tuple[str, str, str], dict[str, tuple[np.ndarray, str]]] = field(
+        default_factory=dict
+    )
+
+    def add(
+        self,
+        dataset_name: str,
+        split: str,
+        image_stem: str,
+        file_name: str,
+        model_stem: str,
+        panel_bgr: np.ndarray,
+    ) -> None:
+        key = (dataset_name, split, image_stem)
+        self._panels.setdefault(key, {})[model_stem] = (panel_bgr, file_name)
+
+    def compose_all(
+        self,
+        vis_root: Path,
+        vis_plan: dict[str, dict[str, list[dict]]],
+        model_stems: list[str],
+    ) -> int:
+        import matplotlib.pyplot as plt
+
+        setup_matplotlib_chinese()
+        n_saved = 0
+        for dataset_name, splits in vis_plan.items():
+            for split, image_infos in splits.items():
+                out_dir = vis_root / vis_group_dir_name(dataset_name, split)
+                for info in image_infos:
+                    file_name = info["file_name"]
+                    image_stem = make_safe_name(Path(file_name).stem)
+                    model_map = self._panels.get((dataset_name, split, image_stem), {})
+                    panels: list[tuple[str, np.ndarray, str]] = []
+                    for model_stem in model_stems:
+                        if model_stem not in model_map:
+                            continue
+                        panel_bgr, fn = model_map[model_stem]
+                        panels.append((model_stem, panel_bgr, fn))
+                    if not panels:
+                        continue
+
+                    n_rows = len(panels)
+                    fig, axes = plt.subplots(
+                        n_rows, 1, figsize=(12.0, max(3.5, 4.0 * n_rows)), squeeze=False
+                    )
+                    for ax, (model_stem, panel_bgr, fn) in zip(axes.flatten(), panels):
+                        ax.imshow(cv2.cvtColor(panel_bgr, cv2.COLOR_BGR2RGB))
+                        ax.set_title(
+                            f"{dataset_name} | {split} | {Path(fn).name} | {model_stem}",
+                            fontsize=10,
+                            pad=8,
+                        )
+                        ax.axis("off")
+                    plt.tight_layout()
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    fig.savefig(out_dir / f"{image_stem}.jpg", dpi=120, bbox_inches="tight", pad_inches=0.12)
+                    plt.close(fig)
+                    n_saved += 1
+        return n_saved
+
+
 def visualize_by_ids(
     dataset: CocoDataset,
     preds_by_image: dict[int, list],
-    vis_group_dir: Path,
+    vis_accum: VisPanelAccumulator,
     image_infos: list[dict],
     model_stem: str,
+    *,
+    dataset_name: str,
+    split: str,
 ):
     id_to_info = {int(i["id"]): i for i in image_infos}
     for image_id, img_info in id_to_info.items():
@@ -325,9 +409,10 @@ def visualize_by_ids(
             raise RuntimeError(f"无法读取图片：{path}")
         preds = preds_by_image.get(image_id, [])
         gts = dataset.gt_by_image_vis.get(image_id, [])
-        image_stem = make_safe_name(Path(img_info["file_name"]).stem)
-        save_path = vis_group_dir / image_stem / f"{make_safe_name(model_stem)}.jpg"
-        draw_boxes(image_bgr, preds, gts, dataset.category_names, save_path)
+        file_name = img_info["file_name"]
+        image_stem = make_safe_name(Path(file_name).stem)
+        panel = render_boxes_bgr(image_bgr, preds, gts, dataset.category_names)
+        vis_accum.add(dataset_name, split, image_stem, file_name, model_stem, panel)
 
 
 def print_metrics(dataset_label: str, metrics: dict):
@@ -342,11 +427,58 @@ def build_run_name(args) -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def parse_vis_conf_specs(specs: list[str] | None) -> dict[str, float]:
+    """解析 ``--vis-conf deimv2_l_march:0.35 dino:0.15``。"""
+    if not specs:
+        return {}
+    out: dict[str, float] = {}
+    for item in specs:
+        if ":" not in item:
+            raise ValueError(
+                f"无效 --vis-conf 项 '{item}'，应为 模型键:阈值，例如 deimv2_l_march:0.35"
+            )
+        key, raw = item.rsplit(":", 1)
+        key = key.strip()
+        if not key:
+            raise ValueError(f"无效 --vis-conf 项 '{item}'：缺少模型键")
+        thr = float(raw.strip())
+        if not (0.0 <= thr <= 1.0):
+            raise ValueError(f"--vis-conf 阈值须在 [0, 1]：{item}")
+        out[key] = thr
+    return out
+
+
+def resolve_vis_conf(
+    model_path: Path,
+    backend: Backend,
+    *,
+    default: float,
+    config_map: dict[str, float] | None = None,
+    cli_map: dict[str, float] | None = None,
+) -> float:
+    """按路径 / display 名子串匹配可视化 conf；CLI 覆盖 config，最长键优先。"""
+    path_s = str(model_path.resolve()).replace("\\", "/")
+    display = display_model_name(model_path, backend)
+    merged: dict[str, float] = {}
+    if config_map:
+        merged.update(config_map)
+    if cli_map:
+        merged.update(cli_map)
+
+    for pattern, conf in sorted(merged.items(), key=lambda kv: len(kv[0]), reverse=True):
+        pat = pattern.replace("\\", "/")
+        if pat in path_s or pat in display or pat in model_path.name:
+            return conf
+    return default
+
+
 # ========================================================================
 # Eval Hf
 # ========================================================================
 
-def infer_dataset_hf(model, processor, device, dataset: CocoDataset, conf: float, nms: float, batch_size: int, num_workers: int):
+def infer_dataset_hf(
+    model, processor, device, dataset: CocoDataset, conf: float, batch_size: int, num_workers: int
+):
     import torch
     from PIL import Image
     from torch.utils.data import DataLoader, Dataset
@@ -396,7 +528,44 @@ def infer_dataset_hf(model, processor, device, dataset: CocoDataset, conf: float
                 if x2 <= x1 or y2 <= y1:
                     continue
                 raw_preds.append({"bbox": [x1, y1, x2, y2], "score": float(s), "category_id": int(lab)})
-            preds_by_image[image_id] = postprocess_nms_per_class(raw_preds, nms)
+            preds_by_image[image_id] = raw_preds
+    return preds_by_image
+
+
+def infer_vis_images_hf(
+    model,
+    processor,
+    device,
+    dataset: CocoDataset,
+    image_infos: list[dict],
+    conf: float,
+    nms: float,
+) -> dict[int, list]:
+    import torch
+    from PIL import Image
+
+    preds_by_image: dict[int, list] = {}
+    id_to_info = {int(i["id"]): i for i in image_infos}
+    for image_id, img_info in id_to_info.items():
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        image = Image.open(path).convert("RGB")
+        w, h = image.size
+        target_sizes = torch.tensor([[h, w]], dtype=torch.int64, device=device)
+        enc = processor(images=image, return_tensors="pt")
+        pixel_values = enc["pixel_values"].to(device)
+        kwargs = {"pixel_values": pixel_values}
+        if "pixel_mask" in enc:
+            kwargs["pixel_mask"] = enc["pixel_mask"].to(device)
+        outputs = model(**kwargs)
+        results = processor.post_process_object_detection(outputs, threshold=conf, target_sizes=target_sizes)
+        res = results[0]
+        raw_preds = []
+        for s, lab, box in zip(res["scores"].tolist(), res["labels"].tolist(), res["boxes"].cpu().float().numpy()):
+            x1, y1, x2, y2 = (float(v) for v in box)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            raw_preds.append({"bbox": [x1, y1, x2, y2], "score": float(s), "category_id": int(lab)})
+        preds_by_image[image_id] = postprocess_nms_per_class(raw_preds, nms)
     return preds_by_image
 
 
@@ -446,7 +615,7 @@ def load_onnx_deploy_spec(
         return OnnxDeploySpec(
             session=session,
             mode="hf_processor",
-            input_size=int(meta.get("input_size", cfg.INPUT_SIZE)),
+            input_size=int(meta.get("input_size", pc.INPUT_SIZE)),
             processor=processor,
             post_cfg=post_cfg,
         )
@@ -454,7 +623,7 @@ def load_onnx_deploy_spec(
     return OnnxDeploySpec(
         session=session,
         mode="legacy_letterbox",
-        input_size=cfg.INPUT_SIZE,
+        input_size=pc.INPUT_SIZE,
     )
 
 
@@ -572,6 +741,19 @@ def infer_dataset_onnx(spec: OnnxDeploySpec, dataset: CocoDataset, conf: float, 
     return preds_by_image
 
 
+def infer_vis_images_onnx(
+    spec: OnnxDeploySpec, dataset: CocoDataset, image_infos: list[dict], conf: float, nms: float
+) -> dict[int, list]:
+    preds_by_image: dict[int, list] = {}
+    for img_info in image_infos:
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        image_bgr = cv2.imread(str(path))
+        if image_bgr is None:
+            raise RuntimeError(f"无法读取图片：{path}")
+        preds_by_image[int(img_info["id"])] = run_onnx_inference(spec, image_bgr, conf, nms)
+    return preds_by_image
+
+
 # ========================================================================
 # Eval Runner
 # ========================================================================
@@ -579,21 +761,29 @@ def infer_dataset_onnx(spec: OnnxDeploySpec, dataset: CocoDataset, conf: float, 
 def evaluate_split(
     preds_by_image: dict[int, list],
     dataset: CocoDataset,
-    vis_root: Path | None,
+    vis_accum: VisPanelAccumulator | None,
     vis_ids: list[dict] | None,
     model_stem: str,
     *,
     dataset_name: str,
     split: str,
     vis_conf: float,
+    nms_thres: float = 1.0,
 ) -> dict:
     metrics = compute_map(preds_by_image, dataset, cfg.MAP_IOU_THRESHOLDS)
     print_metrics(f"  {dataset.name}", metrics)
-    if vis_root is not None and vis_ids:
-        group_dir = vis_root / vis_group_dir_name(dataset_name, split)
+    if vis_accum is not None and vis_ids:
         vis_image_ids = [int(i["id"]) for i in vis_ids]
-        vis_preds = filter_preds_for_vis(preds_by_image, vis_image_ids, vis_conf)
-        visualize_by_ids(dataset, vis_preds, group_dir, vis_ids, model_stem)
+        vis_preds = preds_for_vis(preds_by_image, vis_image_ids, vis_conf, nms_thres)
+        visualize_by_ids(
+            dataset,
+            vis_preds,
+            vis_accum,
+            vis_ids,
+            model_stem,
+            dataset_name=dataset_name,
+            split=split,
+        )
     return metrics
 
 def eval_model_on_datasets(
@@ -604,14 +794,20 @@ def eval_model_on_datasets(
     args,
     vis_conf: float,
     map_conf: float,
+    vis_accum: VisPanelAccumulator | None = None,
 ) -> dict[str, Any]:
     backend = detect_backend(model_path)
     model_stem = display_model_name(model_path, backend)
-    vis_root = run_output_dir / "vis"
     datasets_out: dict[str, dict[str, dict]] = {}
 
     print(f"\n{'=' * 60}\n模型: {model_path} ({backend})\n{'=' * 60}")
-    print(f"mAP 推理 score≥{map_conf:g}；vis 绘制 score≥{vis_conf:g}")
+    if backend == "checkpoint":
+        print(
+            f"mAP score≥{map_conf:g}（HF 后处理，与 train_tea 一致，无额外 NMS）；"
+            f"vis score≥{vis_conf:g}，NMS={args.nms:g}"
+        )
+    else:
+        print(f"mAP 推理 score≥{map_conf:g}，NMS={args.nms:g}；vis 绘制 score≥{vis_conf:g}")
 
     if backend == "onnx":
         try:
@@ -644,12 +840,13 @@ def eval_model_on_datasets(
                     evaluate_split(
                         preds,
                         train_ds,
-                        vis_root,
+                        vis_accum,
                         plan.get("train"),
                         model_stem,
                         dataset_name=spec.name,
                         split="train",
                         vis_conf=vis_conf,
+                        nms_thres=1.0,
                     )
                 )
             elif not args.val_only:
@@ -662,12 +859,13 @@ def eval_model_on_datasets(
                     evaluate_split(
                         preds,
                         val_ds,
-                        vis_root,
+                        vis_accum,
                         plan.get("val"),
                         model_stem,
                         dataset_name=spec.name,
                         split="val",
                         vis_conf=vis_conf,
+                        nms_thres=1.0,
                     )
                 )
             else:
@@ -713,18 +911,19 @@ def eval_model_on_datasets(
             if not args.val_only and spec.train_ann.exists():
                 train_ds = load_coco("train", spec.train_ann, spec.image_dir)
                 preds = infer_dataset_hf(
-                    model, processor, device, train_ds, map_conf, args.nms, args.batch_size, args.num_workers
+                    model, processor, device, train_ds, map_conf, args.batch_size, args.num_workers
                 )
                 ds_metrics["train"] = metrics_for_json(
                     evaluate_split(
                         preds,
                         train_ds,
-                        vis_root,
+                        vis_accum,
                         plan.get("train"),
                         model_stem,
                         dataset_name=spec.name,
                         split="train",
                         vis_conf=vis_conf,
+                        nms_thres=args.nms,
                     )
                 )
             elif not args.val_only:
@@ -733,18 +932,19 @@ def eval_model_on_datasets(
             if spec.val_ann.exists():
                 val_ds = load_coco("val", spec.val_ann, spec.image_dir)
                 preds = infer_dataset_hf(
-                    model, processor, device, val_ds, map_conf, args.nms, args.batch_size, args.num_workers
+                    model, processor, device, val_ds, map_conf, args.batch_size, args.num_workers
                 )
                 ds_metrics["val"] = metrics_for_json(
                     evaluate_split(
                         preds,
                         val_ds,
-                        vis_root,
+                        vis_accum,
                         plan.get("val"),
                         model_stem,
                         dataset_name=spec.name,
                         split="val",
                         vis_conf=vis_conf,
+                        nms_thres=args.nms,
                     )
                 )
             else:
@@ -767,6 +967,153 @@ def eval_model_on_datasets(
         "device": str(device),
         "datasets": datasets_out,
     }
+
+
+def _redraw_vis_splits(
+    *,
+    specs: list[DatasetSpec],
+    vis_plan: dict[str, dict[str, list[dict]]],
+    vis_accum: VisPanelAccumulator,
+    model_stem: str,
+    val_only: bool,
+    vis_conf: float,
+    infer_split,
+) -> None:
+    for spec in specs:
+        if not spec.image_dir.exists():
+            raise FileNotFoundError(f"找不到图片目录：{spec.image_dir}")
+        plan = vis_plan.get(spec.name, {})
+        print(f"\n--- 数据集: {spec.name} ---")
+
+        if not val_only and (vis_ids := plan.get("train")):
+            if spec.train_ann.exists():
+                train_ds = load_coco("train", spec.train_ann, spec.image_dir)
+                preds = infer_split(train_ds, vis_ids)
+                vis_image_ids = [int(i["id"]) for i in vis_ids]
+                vis_preds = filter_preds_for_vis(preds, vis_image_ids, vis_conf)
+                visualize_by_ids(
+                    train_ds,
+                    vis_preds,
+                    vis_accum,
+                    vis_ids,
+                    model_stem,
+                    dataset_name=spec.name,
+                    split="train",
+                )
+            else:
+                print(f"警告: 未找到 {spec.name} train 标注，跳过 train 可视化。")
+
+        if vis_ids := plan.get("val"):
+            if spec.val_ann.exists():
+                val_ds = load_coco("val", spec.val_ann, spec.image_dir)
+                preds = infer_split(val_ds, vis_ids)
+                vis_image_ids = [int(i["id"]) for i in vis_ids]
+                vis_preds = filter_preds_for_vis(preds, vis_image_ids, vis_conf)
+                visualize_by_ids(
+                    val_ds,
+                    vis_preds,
+                    vis_accum,
+                    vis_ids,
+                    model_stem,
+                    dataset_name=spec.name,
+                    split="val",
+                )
+            else:
+                print(f"警告: 未找到 {spec.name} val 标注，跳过 val 可视化。")
+
+
+def redraw_vis_for_model(
+    model_path: Path,
+    specs: list[DatasetSpec],
+    vis_plan: dict[str, dict[str, list[dict]]],
+    run_output_dir: Path,
+    args,
+    vis_conf: float,
+    map_conf: float,
+    vis_accum: VisPanelAccumulator | None = None,
+) -> None:
+    """仅对 vis 抽样图重新推理并覆盖 vis/，不重新计算 mAP。"""
+    if vis_accum is None:
+        return
+    backend = detect_backend(model_path)
+    model_stem = display_model_name(model_path, backend)
+
+    print(f"\n{'=' * 60}\n[重绘 vis] 模型: {model_path} ({backend})\n{'=' * 60}")
+    print(f"vis 重绘 score≥{vis_conf:g}，NMS={args.nms:g}")
+
+    if backend == "onnx":
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise SystemExit("缺少 onnxruntime，请先安装：pip install onnxruntime") from exc
+
+        if not model_path.exists():
+            raise FileNotFoundError(f"找不到 ONNX 模型：{model_path}")
+
+        onnx_spec = load_onnx_deploy_spec(
+            model_path,
+            args.device,
+            args.providers,
+            config_providers=getattr(cfg, "ONNX_PROVIDERS", None),
+        )
+        print(f"ONNX mode: {onnx_spec.mode}, providers: {onnx_spec.session.get_providers()}")
+
+        def infer_split(dataset: CocoDataset, image_infos: list[dict]) -> dict[int, list]:
+            return infer_vis_images_onnx(onnx_spec, dataset, image_infos, map_conf, args.nms)
+
+        _redraw_vis_splits(
+            specs=specs,
+            vis_plan=vis_plan,
+            vis_accum=vis_accum,
+            model_stem=model_stem,
+            val_only=args.val_only,
+            vis_conf=vis_conf,
+            infer_split=infer_split,
+        )
+        return
+
+    import torch
+    from transformers import Deimv2ForObjectDetection
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"找不到 checkpoint：{model_path}")
+
+    device = resolve_torch_device(args.device)
+    print(f"torch device: {device}")
+    processor = load_deimv2_processor(model_path)
+    model = Deimv2ForObjectDetection.from_pretrained(str(model_path))
+    model.to(device)
+    model.eval()
+
+    try:
+        with torch.no_grad():
+            def infer_split(dataset: CocoDataset, image_infos: list[dict]) -> dict[int, list]:
+                return infer_vis_images_hf(
+                    model, processor, device, dataset, image_infos, map_conf, args.nms
+                )
+
+            _redraw_vis_splits(
+                specs=specs,
+                vis_plan=vis_plan,
+                vis_accum=vis_accum,
+                model_stem=model_stem,
+                val_only=args.val_only,
+                vis_conf=vis_conf,
+                infer_split=infer_split,
+            )
+    finally:
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+
+def update_model_vis_conf(models_results: list[dict], model_path: Path, vis_conf: float) -> None:
+    resolved = normalize_model_path(model_path)
+    for m in models_results:
+        if normalize_model_path(m.get("path", "")) == resolved:
+            m["vis_conf_threshold"] = vis_conf
+            m["conf_threshold"] = vis_conf
+            return
 
 
 # ========================================================================
@@ -880,6 +1227,87 @@ def load_report(metrics_path: Path) -> dict:
         return json.load(f)
 
 
+def find_metrics_path(run_dir: Path) -> Path | None:
+    """在评测 run 目录下查找 metrics_*.json。"""
+    run_dir = run_dir.expanduser().resolve()
+    if not run_dir.is_dir():
+        return None
+    found = sorted(run_dir.glob("metrics_*.json"))
+    if not found:
+        return None
+    preferred = run_dir / f"metrics_{run_dir.name}.json"
+    if preferred.is_file():
+        return preferred
+    return found[0]
+
+
+def normalize_model_path(path: str | Path) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def completed_model_paths(report: dict[str, Any]) -> set[Path]:
+    out: set[Path] = set()
+    for m in report.get("models", []):
+        p = m.get("path")
+        if p:
+            out.add(normalize_model_path(p))
+    return out
+
+
+def resolve_eval_run(
+    args,
+    *,
+    project_root: Path | None = None,
+) -> tuple[str, Path, dict[str, Any] | None, bool]:
+    """
+    解析评测输出目录。
+
+    续跑（返回 is_resume=True）当：
+    - 指定了 ``--resume``（run 目录或 metrics JSON）；
+    - ``--output_dir`` 本身已是含 metrics_*.json 的 run 目录；
+    - ``--output_dir`` 为 eval 根且 ``--run_name`` 对应子目录已存在 metrics。
+    """
+    root = project_root or ROOT
+
+    def _resolve(p: Path) -> Path:
+        return (root / p).resolve() if not p.is_absolute() else p.expanduser().resolve()
+
+    resume_raw = getattr(args, "resume", None)
+    if resume_raw is not None:
+        target = _resolve(resume_raw)
+        if target.is_file():
+            metrics_path = target
+            run_dir = target.parent
+        elif target.is_dir():
+            metrics_path = find_metrics_path(target)
+            if metrics_path is None:
+                raise SystemExit(f"目录中未找到 metrics_*.json: {target}")
+            run_dir = target
+        else:
+            raise SystemExit(f"--resume 路径不存在: {target}")
+        report = load_report(metrics_path)
+        run_name = (report.get("run") or {}).get("name") or run_dir.name
+        return run_name, run_dir, report, True
+
+    output_dir = _resolve(args.output_dir)
+
+    metrics_here = find_metrics_path(output_dir)
+    if metrics_here is not None:
+        report = load_report(metrics_here)
+        run_name = (report.get("run") or {}).get("name") or output_dir.name
+        return run_name, output_dir, report, True
+
+    if args.run_name:
+        named_dir = output_dir / make_safe_name(args.run_name)
+        metrics_named = find_metrics_path(named_dir)
+        if metrics_named is not None:
+            report = load_report(metrics_named)
+            return make_safe_name(args.run_name), named_dir, report, True
+
+    run_name = build_run_name(args)
+    return run_name, output_dir / run_name, None, False
+
+
 def default_charts_dir(metrics_path: Path, override: Path | None) -> Path:
     if override is not None:
         return override.expanduser().resolve()
@@ -977,7 +1405,7 @@ def format_chart_eval_params(report: dict[str, Any]) -> str:
         parts.append(f"vis conf≥{float(vis_thr):g}")
     nms = ep.get("nms_threshold")
     if nms is not None:
-        parts.append(f"NMS={float(nms):g}")
+        parts.append(f"vis NMS={float(nms):g}")
     isize = ep.get("input_size")
     if isize is not None:
         parts.append(f"input={int(isize)}")

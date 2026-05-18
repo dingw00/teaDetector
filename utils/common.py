@@ -88,6 +88,19 @@ def resolve_checkpoint_epoch(model_path: Path) -> int | None:
     return None
 
 
+def checkpoint_onnx_basename(checkpoint_dir: Path) -> str:
+    """ONNX 默认文件名（无扩展名），如 deimv2_l_march_epoch143（不用 checkpoint-best）。"""
+    parent = make_safe_name(checkpoint_dir.parent.name)
+    leaf = checkpoint_dir.name
+    if leaf in ("checkpoint-best", "final") or leaf.startswith("checkpoint-"):
+        ep = resolve_checkpoint_epoch(checkpoint_dir)
+        if ep is not None:
+            return f"{parent}_epoch{ep}"
+        if leaf in ("checkpoint-best", "final"):
+            return parent
+    return f"{parent}_{make_safe_name(leaf)}"
+
+
 def display_model_name(model_path: Path, backend: Backend) -> str:
     """图表/汇总用的短名。HF 权重目录用「父目录-epochN」，避免多个 checkpoint-best 重名。"""
     if backend == "onnx":
@@ -107,6 +120,22 @@ def resolve_pretrained_hub_id(pretrained: str) -> str:
     if pretrained not in HF_DEIMV2_PRESETS:
         raise ValueError(f"未知 --pretrained={pretrained!r}，可选: {tuple(HF_DEIMV2_PRESETS)}")
     return HF_DEIMV2_PRESETS[pretrained]
+
+
+def as_pretrained_identifier(path_or_id: str | Path) -> str:
+    """传给 transformers.from_pretrained 的标识：本地路径 resolve；Hub repo id 保留 '/'。
+
+    Windows 上 Path('org/model') 会变成 org\\model，导致 HuggingFace 校验失败。
+    """
+    if isinstance(path_or_id, Path):
+        return str(path_or_id.resolve())
+    p = Path(path_or_id)
+    if p.exists():
+        return str(p.resolve())
+    if "/" in path_or_id and "\\" not in path_or_id:
+        if len(path_or_id) < 2 or path_or_id[1] != ":":
+            return path_or_id
+    return str(p.resolve() if p.is_absolute() else p)
 
 
 def setup_chinese_font() -> str:
