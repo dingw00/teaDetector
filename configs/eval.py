@@ -7,17 +7,17 @@ from configs.preprocess import INPUT_SIZE
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 MODELS = [
-    ROOT_DIR / "onnx_models" / "dino_0329_30.onnx",
+    # ROOT_DIR / "onnx_models" / "dino_0329_30.onnx",
     # ROOT_DIR / "outputs" / "deimv2_s_march" / "checkpoint-best",
     
     ROOT_DIR / "outputs" / "deimv2_l_march" / "checkpoint-best",
-    # ROOT_DIR / "onnx_models" / "deimv2_l_march_checkpoint-best.onnx",
-    # ROOT_DIR / "outputs" / "deimv2_l_march_and_april" / "checkpoint-best",
-    ROOT_DIR / "outputs" / "deimv2_l_april_then_march" / "checkpoint-best",
+    ROOT_DIR / "onnx_models" / "deimv2_l_march_epoch115.onnx",
+    # ROOT_DIR / "outputs" / "deimv2_l_march_and_april_1_20" / "checkpoint-best",
+    # ROOT_DIR / "outputs" / "deimv2_l_april_then_march" / "checkpoint-best",
     ROOT_DIR / "outputs" / "deimv2_l_april_then_marchapril" / "checkpoint-best",
-    # ROOT_DIR / "onnx_models" / "deimv2_l_march_and_april_checkpoint-best.onnx",
+    ROOT_DIR / "onnx_models" / "deimv2_l_april_then_marchapril_epoch194.onnx",
     ROOT_DIR / "outputs" / "deimv2_l_april" / "checkpoint-best",
-    # ROOT_DIR / "onnx_models" / "deimv2_l_april_checkpoint-best.onnx",
+    ROOT_DIR / "onnx_models" / "deimv2_l_april_epoch143.onnx",
 
 ]
 
@@ -47,6 +47,8 @@ VIS_CONF_BY_MODEL: dict[str, float] = {
 }
 MAP_IOU_THRESHOLDS = [x / 100 for x in range(50, 100, 5)]
 VIS_NUM_IMAGES = 2
+# vis/ 多模型竖拼：每行保留原图分辨率，JPEG 质量 1–100。
+VIS_JPEG_QUALITY = 95
 RANDOM_SEED = 42
 OUTPUT_DIR = ROOT_DIR / "outputs" / "eval"
 DEVICE = None

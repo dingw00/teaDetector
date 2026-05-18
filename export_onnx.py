@@ -7,7 +7,8 @@
 
 用法：
   python export_onnx.py outputs/deimv2_s_march/checkpoint-best
-  python export_onnx.py -o onnx_models/mymodel.onnx --check --verify
+  # 默认输出 onnx_models/deimv2_s_march_epoch<N>.onnx（从 checkpoint 解析 epoch，不用 checkpoint-best）
+  python export_onnx.py -o onnx_models/mymodel_epoch50.onnx --check --verify
 
 配置：configs/export_onnx.py（CHECKPOINT、OPSET、VERIFY 等默认值）。
 """

@@ -298,26 +298,98 @@ def build_vis_plan(
             print(f"警告: 未找到 {spec.name} val 标注，跳过 val 可视化抽样。")
     return plan
 
+def _vis_draw_scale(height: int, width: int) -> float:
+    """大图略放大标注（折中：比固定 0.5/2px 稍大，又不过粗）。"""
+    return min(1.35, max(1.0, min(height, width) / 800.0))
+
+
 def render_boxes_bgr(image_bgr, preds, gts, category_names) -> np.ndarray:
     image = image_bgr.copy()
+    h, w = image.shape[:2]
+    scale = _vis_draw_scale(h, w)
+    box_thickness = max(2, int(round(1.5 * scale)))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.52 * scale
+    text_thickness = 2 if scale >= 1.15 else 1
+    line_type = cv2.LINE_AA
+
     for gt in gts:
         x1, y1, x2, y2 = [int(round(v)) for v in gt["bbox"]]
         name = category_names.get(gt["category_id"], str(gt["category_id"]))
         suffix = " [crowd]" if gt.get("iscrowd") else ""
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 220, 0), 2)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 220, 0), box_thickness)
+        label_y = max(int(16 * scale), y1 - int(5 * scale))
         cv2.putText(
-            image, f"GT:{name}{suffix}", (x1, max(15, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 0), 1, cv2.LINE_AA,
+            image,
+            f"GT:{name}{suffix}",
+            (x1, label_y),
+            font,
+            font_scale,
+            (0, 220, 0),
+            text_thickness,
+            line_type,
         )
     for pred in preds:
         x1, y1, x2, y2 = [int(round(v)) for v in pred["bbox"]]
         name = category_names.get(pred["category_id"], str(pred["category_id"]))
-        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 80, 255), 2)
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 80, 255), box_thickness)
+        label_y = min(h - int(4 * scale), y2 + int(16 * scale))
         cv2.putText(
-            image, f"P:{name} {pred['score']:.2f}", (x1, min(image.shape[0] - 5, y2 + 16)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 80, 255), 1, cv2.LINE_AA,
+            image,
+            f"P:{name} {pred['score']:.2f}",
+            (x1, label_y),
+            font,
+            font_scale,
+            (0, 80, 255),
+            text_thickness,
+            line_type,
         )
     return image
+
+
+def _align_panel_width(panel_bgr: np.ndarray, target_w: int) -> np.ndarray:
+    h, w = panel_bgr.shape[:2]
+    if w == target_w:
+        return panel_bgr
+    new_h = max(1, int(round(h * target_w / w)))
+    return cv2.resize(panel_bgr, (target_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _vis_title_bar(width: int, text: str, scale: float) -> np.ndarray:
+    bar_h = max(34, int(round(32 * scale)))
+    bar = np.full((bar_h, width, 3), 245, dtype=np.uint8)
+    cv2.line(bar, (0, bar_h - 1), (width - 1, bar_h - 1), (210, 210, 210), 1, cv2.LINE_AA)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1 if scale < 1.15 else 2
+    font_scale = 0.52 * scale
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    while tw > width - 20 and font_scale > 0.35:
+        font_scale -= 0.05
+        (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    y = (bar_h + th) // 2
+    cv2.putText(bar, text, (10, y), font, font_scale, (50, 50, 50), thickness, cv2.LINE_AA)
+    return bar
+
+
+def stack_vis_panels(
+    panels: list[tuple[str, np.ndarray, str]],
+    *,
+    dataset_name: str,
+    split: str,
+) -> np.ndarray:
+    """按原图分辨率纵向拼接多模型面板（每行前加标题条）。"""
+    if not panels:
+        raise ValueError("stack_vis_panels: panels 为空")
+    target_w = max(p[1].shape[1] for p in panels)
+    ref_h = panels[0][1].shape[0]
+    scale = _vis_draw_scale(ref_h, target_w)
+    rows: list[np.ndarray] = []
+    for model_stem, panel_bgr, fn in panels:
+        panel = _align_panel_width(panel_bgr, target_w)
+        title = f"{dataset_name} | {split} | {Path(fn).name} | {model_stem}"
+        rows.append(_vis_title_bar(target_w, title, scale))
+        rows.append(panel)
+    return np.vstack(rows)
 
 
 def vis_group_dir_name(dataset_name: str, split: str) -> str:
@@ -351,9 +423,8 @@ class VisPanelAccumulator:
         vis_plan: dict[str, dict[str, list[dict]]],
         model_stems: list[str],
     ) -> int:
-        import matplotlib.pyplot as plt
-
-        setup_matplotlib_chinese()
+        jpeg_q = int(getattr(cfg, "VIS_JPEG_QUALITY", 95))
+        jpeg_q = max(1, min(100, jpeg_q))
         n_saved = 0
         for dataset_name, splits in vis_plan.items():
             for split, image_infos in splits.items():
@@ -371,22 +442,16 @@ class VisPanelAccumulator:
                     if not panels:
                         continue
 
-                    n_rows = len(panels)
-                    fig, axes = plt.subplots(
-                        n_rows, 1, figsize=(12.0, max(3.5, 4.0 * n_rows)), squeeze=False
+                    stacked = stack_vis_panels(
+                        panels, dataset_name=dataset_name, split=split
                     )
-                    for ax, (model_stem, panel_bgr, fn) in zip(axes.flatten(), panels):
-                        ax.imshow(cv2.cvtColor(panel_bgr, cv2.COLOR_BGR2RGB))
-                        ax.set_title(
-                            f"{dataset_name} | {split} | {Path(fn).name} | {model_stem}",
-                            fontsize=10,
-                            pad=8,
-                        )
-                        ax.axis("off")
-                    plt.tight_layout()
                     out_dir.mkdir(parents=True, exist_ok=True)
-                    fig.savefig(out_dir / f"{image_stem}.jpg", dpi=120, bbox_inches="tight", pad_inches=0.12)
-                    plt.close(fig)
+                    out_path = out_dir / f"{image_stem}.jpg"
+                    cv2.imwrite(
+                        str(out_path),
+                        stacked,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q],
+                    )
                     n_saved += 1
         return n_saved
 
@@ -657,7 +722,9 @@ def _preds_from_deploy_outputs(labels, boxes, scores, conf_thres: float, nms_thr
         preds.append(
             {"bbox": [x1, y1, x2, y2], "score": float(score), "category_id": int(label)}
         )
-    return postprocess_nms_per_class(preds, nms_thres)
+    if nms_thres < 1.0:
+        return postprocess_nms_per_class(preds, nms_thres)
+    return preds
 
 
 def postprocess_onnx(outputs, ratio, pad_w, pad_h, orig_w, orig_h, conf_thres, nms_thres):
@@ -678,7 +745,9 @@ def postprocess_onnx(outputs, ratio, pad_w, pad_h, orig_w, orig_h, conf_thres, n
         y2 = max(0.0, min(float(y2), float(orig_h)))
         if x2 > x1 and y2 > y1:
             preds.append({"bbox": [x1, y1, x2, y2], "score": float(score), "category_id": int(label)})
-    return postprocess_nms_per_class(preds, nms_thres)
+    if nms_thres < 1.0:
+        return postprocess_nms_per_class(preds, nms_thres)
+    return preds
 
 
 def run_onnx_inference_legacy(
@@ -724,20 +793,21 @@ def run_onnx_inference_hf(spec: OnnxDeploySpec, image_bgr: np.ndarray, conf: flo
     return _preds_from_deploy_outputs(labels, boxes, scores, conf, nms)
 
 
-def run_onnx_inference(spec: OnnxDeploySpec, image_bgr: np.ndarray, conf: float, nms: float):
+def run_onnx_inference(spec: OnnxDeploySpec, image_bgr: np.ndarray, conf: float, *, nms_thres: float):
     if spec.mode == "hf_processor":
-        return run_onnx_inference_hf(spec, image_bgr, conf, nms)
-    return run_onnx_inference_legacy(spec.session, image_bgr, spec.input_size, conf, nms)
+        return run_onnx_inference_hf(spec, image_bgr, conf, nms_thres)
+    return run_onnx_inference_legacy(spec.session, image_bgr, spec.input_size, conf, nms_thres)
 
 
-def infer_dataset_onnx(spec: OnnxDeploySpec, dataset: CocoDataset, conf: float, nms: float) -> dict[int, list]:
+def infer_dataset_onnx(spec: OnnxDeploySpec, dataset: CocoDataset, conf: float) -> dict[int, list]:
+    """全量 mAP 推理：与 HF 一致，仅 score 阈值，不做 NMS。"""
     preds_by_image = {}
     for img_info in dataset.images:
         path = resolve_image_path(dataset.image_dir, img_info["file_name"])
         image_bgr = cv2.imread(str(path))
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
-        preds_by_image[img_info["id"]] = run_onnx_inference(spec, image_bgr, conf, nms)
+        preds_by_image[img_info["id"]] = run_onnx_inference(spec, image_bgr, conf, nms_thres=1.0)
     return preds_by_image
 
 
@@ -750,7 +820,9 @@ def infer_vis_images_onnx(
         image_bgr = cv2.imread(str(path))
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
-        preds_by_image[int(img_info["id"])] = run_onnx_inference(spec, image_bgr, conf, nms)
+        preds_by_image[int(img_info["id"])] = run_onnx_inference(
+            spec, image_bgr, conf, nms_thres=nms
+        )
     return preds_by_image
 
 
@@ -807,7 +879,10 @@ def eval_model_on_datasets(
             f"vis score≥{vis_conf:g}，NMS={args.nms:g}"
         )
     else:
-        print(f"mAP 推理 score≥{map_conf:g}，NMS={args.nms:g}；vis 绘制 score≥{vis_conf:g}")
+        print(
+            f"mAP score≥{map_conf:g}（ONNX 后处理，与 HF 一致，无额外 NMS）；"
+            f"vis score≥{vis_conf:g}，NMS={args.nms:g}"
+        )
 
     if backend == "onnx":
         try:
@@ -835,7 +910,7 @@ def eval_model_on_datasets(
 
             if not args.val_only and spec.train_ann.exists():
                 train_ds = load_coco("train", spec.train_ann, spec.image_dir)
-                preds = infer_dataset_onnx(onnx_spec, train_ds, map_conf, args.nms)
+                preds = infer_dataset_onnx(onnx_spec, train_ds, map_conf)
                 ds_metrics["train"] = metrics_for_json(
                     evaluate_split(
                         preds,
@@ -854,7 +929,7 @@ def eval_model_on_datasets(
 
             if spec.val_ann.exists():
                 val_ds = load_coco("val", spec.val_ann, spec.image_dir)
-                preds = infer_dataset_onnx(onnx_spec, val_ds, map_conf, args.nms)
+                preds = infer_dataset_onnx(onnx_spec, val_ds, map_conf)
                 ds_metrics["val"] = metrics_for_json(
                     evaluate_split(
                         preds,
@@ -1583,6 +1658,7 @@ def plot_metric_heatmaps(report: dict[str, Any], charts_dir: Path):
 
 
 def plot_comparison_charts(report: dict[str, Any], charts_dir: Path):
+    refresh_model_display_names(report)
     plt = setup_matplotlib_chinese()
     charts_dir.mkdir(parents=True, exist_ok=True)
 

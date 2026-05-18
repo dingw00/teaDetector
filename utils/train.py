@@ -1922,15 +1922,80 @@ def iter_checkpoint_metrics(run_dir: Path, max_epoch: int | None) -> list[tuple[
     return rows
 
 
-def _append_val_maps(tracks: MapTracks, d: dict, map_key: str) -> None:
-    per_ds = d.get("val_map_per_dataset")
+def _default_val_dataset_key(run_dir: Path, metrics: dict | None = None) -> str:
+    """无 dataset_roots 时的回退键（单数据集 run 目录名推断）。"""
+    if metrics is not None:
+        name = _infer_single_val_dataset_name(metrics, run_dir)
+        if name:
+            return name
+    return _infer_val_name_from_run_dir(run_dir) or "val"
+
+
+def _val_dataset_key_from_metrics(metrics: dict, fallback: str) -> str:
+    """按当前 epoch 的 metrics 判断 val 所属数据集（支持训练中途切换 val 集）。"""
+    per_ds = metrics.get("val_map_per_dataset")
     if isinstance(per_ds, dict) and per_ds:
-        for name, metrics in per_ds.items():
-            if isinstance(metrics, dict):
-                tracks.val_per_dataset.setdefault(str(name), []).append(map_metric(metrics, map_key))
+        if len(per_ds) == 1:
+            only = next(iter(per_ds))
+            if str(only) != "val":
+                return str(only)
+        return fallback
+    roots = metrics.get("dataset_roots")
+    if isinstance(roots, list) and len(roots) == 1:
+        name = _path_basename(roots[0])
+        if name != "—":
+            return name
+    return fallback
+
+
+def _record_val_map_points(
+    val_points: dict[str, dict[int, float]],
+    epoch: int,
+    metrics: dict,
+    map_key: str,
+    default_key: str,
+) -> None:
+    per_ds = metrics.get("val_map_per_dataset")
+    if isinstance(per_ds, dict) and per_ds:
+        for name, m in per_ds.items():
+            if isinstance(m, dict):
+                val_points.setdefault(str(name), {})[epoch] = map_metric(m, map_key)
     else:
-        vm = d.get("val_map") or {}
-        tracks.val_per_dataset.setdefault("val", []).append(map_metric(vm, map_key))
+        vm = metrics.get("val_map") or {}
+        key = _val_dataset_key_from_metrics(metrics, default_key)
+        val_points.setdefault(key, {})[epoch] = map_metric(vm, map_key)
+
+
+def _merge_val_alias(val_points: dict[str, dict[int, float]], alias: str, canonical: str) -> None:
+    if alias not in val_points or alias == canonical:
+        return
+    target = val_points.setdefault(canonical, {})
+    for ep, value in val_points.pop(alias).items():
+        target.setdefault(ep, value)
+
+
+def _consolidate_val_points(val_points: dict[str, dict[int, float]], run_dir: Path) -> None:
+    """仅合并同一数据集、仅 metrics 格式不同的 val 占位键（epoch 有重叠时才合并）。"""
+    if "val" not in val_points:
+        return
+    val_epochs = set(val_points["val"])
+    for name in list(val_points):
+        if name == "val":
+            continue
+        if val_epochs & set(val_points[name]):
+            _merge_val_alias(val_points, "val", name)
+            return
+    if len(val_points) == 1:
+        canonical = _infer_val_name_from_run_dir(run_dir)
+        if canonical and canonical != "val":
+            val_points[canonical] = val_points.pop("val")
+
+
+def _val_lists_from_points(
+    val_points: dict[str, dict[int, float]],
+    epochs: list[int],
+) -> dict[str, list[float]]:
+    return {name: [ep_map.get(ep, float("nan")) for ep in epochs] for name, ep_map in val_points.items()}
 
 
 def load_series(run_dir: Path, max_epoch: int | None) -> RunSeries:
@@ -1940,20 +2005,25 @@ def load_series(run_dir: Path, max_epoch: int | None) -> RunSeries:
     track_mean = False
     last_metrics: dict = {}
     inferred_val_name: str | None = None
+    val_coco_points: dict[str, dict[int, float]] = {}
+    val50_points: dict[str, dict[int, float]] = {}
+    default_val_key = _default_val_dataset_key(series.run_dir)
 
     for epoch, d in iter_checkpoint_metrics(run_dir, max_epoch):
         last_metrics = d
         if inferred_val_name is None:
-            inferred_val_name = _infer_single_val_dataset_name(d, run_dir)
-        series.epochs.append(int(d.get("epoch", epoch)))
+            inferred_val_name = _infer_single_val_dataset_name(d, series.run_dir)
+        ep = int(d.get("epoch", epoch))
+        val_key = _val_dataset_key_from_metrics(d, default_val_key)
+        series.epochs.append(ep)
         series.train_loss.append(float(d["train_loss"]))
 
         tm = d.get("train_map") or {}
         series.map_coco.train.append(map_metric(tm, MAP_COCO_KEY, fallback=map_metric(d, MAP_COCO_KEY)))
         series.map50.train.append(map_metric(tm, MAP50_KEY))
 
-        _append_val_maps(series.map_coco, d, MAP_COCO_KEY)
-        _append_val_maps(series.map50, d, MAP50_KEY)
+        _record_val_map_points(val_coco_points, ep, d, MAP_COCO_KEY, val_key)
+        _record_val_map_points(val50_points, ep, d, MAP50_KEY, val_key)
 
         mean_m = d.get("val_map_mean")
         if isinstance(mean_m, dict) and mean_m:
@@ -1963,6 +2033,11 @@ def load_series(run_dir: Path, max_epoch: int | None) -> RunSeries:
         else:
             mean_coco.append(float("nan"))
             mean_50.append(float("nan"))
+
+    _consolidate_val_points(val_coco_points, series.run_dir)
+    _consolidate_val_points(val50_points, series.run_dir)
+    series.map_coco.val_per_dataset = _val_lists_from_points(val_coco_points, series.epochs)
+    series.map50.val_per_dataset = _val_lists_from_points(val50_points, series.epochs)
 
     if track_mean:
         series.map_coco.val_mean = mean_coco
@@ -1999,20 +2074,25 @@ def _plot_line(
     ax.plot(epochs, y, label=label, **kw)
 
 
-def _build_map_lines(
+def _plot_sparse_line(
+    ax,
     epochs: list[int],
-    tracks: MapTracks,
-) -> list[tuple[list[float], str, bool]]:
-    """返回 (y, legend_label, dense_dash)。"""
-    lines: list[tuple[list[float], str, bool]] = [
-        (tracks.train, "train", False),
-    ]
-    for ds_name, values in tracks.val_per_dataset.items():
-        if len(values) == len(epochs):
-            lines.append((values, _val_legend_label(ds_name), False))
-    if tracks.val_mean is not None and len(tracks.val_mean) == len(epochs):
-        lines.append((tracks.val_mean, "val · 均值", True))
-    return lines
+    y: list[float],
+    index: int,
+    label: str,
+    use_markers: bool,
+    *,
+    dense_dash: bool = False,
+) -> None:
+    """仅绘制有值的 epoch（训练中途切换 val 集时各数据集各画一段）。"""
+    xs = [e for e, v in zip(epochs, y) if v == v]
+    ys = [v for v in y if v == v]
+    if not xs:
+        return
+    kw = _line_style(index, use_markers)
+    if dense_dash:
+        kw["linestyle"] = _MEAN_DASH
+    ax.plot(xs, ys, label=label, **kw)
 
 
 def _plot_map_subplot(
@@ -2022,8 +2102,22 @@ def _plot_map_subplot(
     title: str,
     use_markers: bool,
 ) -> None:
-    for i, (y, label, dense_dash) in enumerate(_build_map_lines(epochs, tracks)):
-        _plot_line(ax, epochs, y, i, label, use_markers, dense_dash=dense_dash)
+    _plot_line(ax, epochs, tracks.train, 0, "train", use_markers)
+    color_idx = 1
+    for ds_name, values in tracks.val_per_dataset.items():
+        if len(values) == len(epochs) and any(v == v for v in values):
+            _plot_sparse_line(
+                ax, epochs, values, color_idx, _val_legend_label(ds_name), use_markers
+            )
+            color_idx += 1
+    if (
+        tracks.val_mean is not None
+        and len(tracks.val_mean) == len(epochs)
+        and any(v == v for v in tracks.val_mean)
+    ):
+        _plot_sparse_line(
+            ax, epochs, tracks.val_mean, color_idx, "val · 均值", use_markers, dense_dash=True
+        )
     ax.set_ylabel(MAP_YLABEL)
     ax.set_title(title)
     ax.legend(loc="best", fontsize=7.5)

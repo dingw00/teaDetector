@@ -15,7 +15,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 
 CHECKPOINT: Path | None = None # outputs/deimv2_s_march/checkpoint-best
 
-OUTPUT: Path | None = None  # 未设则 onnx_models/<run>_epochN.onnx
+OUTPUT: Path | None = None  # 未设则 onnx_models/<run>_epochN.onnx（不用 checkpoint-best 作文件名）
 OPSET = 17
 INPUT_SIZE = INPUT_SIZE
 DYNAMIC_BATCH = False

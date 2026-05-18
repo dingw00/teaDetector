@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -101,10 +102,8 @@ def checkpoint_onnx_basename(checkpoint_dir: Path) -> str:
     return f"{parent}_{make_safe_name(leaf)}"
 
 
-def display_model_name(model_path: Path, backend: Backend) -> str:
-    """图表/汇总用的短名。HF 权重目录用「父目录-epochN」，避免多个 checkpoint-best 重名。"""
-    if backend == "onnx":
-        return make_safe_name(model_path.stem)
+def _checkpoint_chart_base(model_path: Path) -> str:
+    """HF checkpoint 图表基名：run-epochN，不出现 checkpoint-best。"""
     leaf = model_path.name
     parent = model_path.parent.name
     if leaf in ("checkpoint-best", "final") or leaf.startswith("checkpoint-"):
@@ -113,6 +112,45 @@ def display_model_name(model_path: Path, backend: Backend) -> str:
             return make_safe_name(f"{parent}-epoch{ep}")
         return make_safe_name(parent)
     return make_safe_name(leaf)
+
+
+def _onnx_chart_base_from_meta(onnx_path: Path) -> str | None:
+    meta_path = onnx_path.with_suffix(".meta.json")
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        ckpt = meta.get("checkpoint")
+        if ckpt:
+            return _checkpoint_chart_base(Path(ckpt))
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _onnx_stem_chart_base(stem: str) -> str:
+    """从 .onnx 文件名解析图表基名（兼容旧版 *_checkpoint-best.onnx）。"""
+    stem = make_safe_name(stem)
+    m = re.search(r"_epoch(\d+)$", stem, re.IGNORECASE)
+    if m:
+        return make_safe_name(f"{stem[: m.start()]}-epoch{m.group(1)}")
+    m = re.search(r"_checkpoint-epoch(\d+)$", stem, re.IGNORECASE)
+    if m:
+        return make_safe_name(f"{stem[: m.start()]}-epoch{m.group(1)}")
+    for marker in ("_checkpoint-best", "-checkpoint-best", "_final", "-final"):
+        if marker in stem:
+            base = stem.split(marker, 1)[0].rstrip("-_")
+            if base:
+                return make_safe_name(base)
+    return stem
+
+
+def display_model_name(model_path: Path, backend: Backend) -> str:
+    """图表/汇总用的短名。checkpoint 为 run-epochN；ONNX 为 run-epochN（onnx）。"""
+    if backend == "onnx":
+        base = _onnx_chart_base_from_meta(model_path) or _onnx_stem_chart_base(model_path.stem)
+        return f"{base}（onnx）"
+    return _checkpoint_chart_base(model_path)
 
 
 def resolve_pretrained_hub_id(pretrained: str) -> str:
