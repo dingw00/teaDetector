@@ -46,6 +46,13 @@ from torchvision.transforms import v2
 from transformers import Deimv2ForObjectDetection
 
 from utils.common import PROJECT_ROOT
+from configs import preprocess as pc
+from utils.preprocess import (
+    letterbox_inverse_xyxy,
+    letterbox_params,
+    letterbox_pil_coco,
+    uses_letterbox,
+)
 
 AUG_LEVELS = (1, 2, 3, 4, 5)
 DEFAULT_AUG_LEVEL = 5
@@ -620,8 +627,9 @@ def build_detection_augment(
     iou_crop_p: float,
     flip_p: float,
     photometric_magnitude: float = 1.0,
+    final_stretch_resize: bool = True,
 ) -> v2.Compose:
-    """对齐常见 RT-DETR/DEIM 式 train dataloader：几何 + 光度，Resize 640 后再交给 HF。"""
+    """对齐常见 RT-DETR/DEIM 式 train dataloader；letterbox 模式下不在此做末尾 Resize。"""
     m = max(0.0, min(1.0, float(photometric_magnitude)))
     photometric_steps: list = []
     if photometric_p > 0:
@@ -642,17 +650,16 @@ def build_detection_augment(
                     p=photometric_p,
                 )
             )
-    return v2.Compose(
-        [
-            *photometric_steps,
-            v2.RandomZoomOut(fill=zoomout_fill, p=zoomout_p),
-            v2.RandomApply([v2.RandomIoUCrop()], p=iou_crop_p),
-            v2.SanitizeBoundingBoxes(min_size=1.0),
-            v2.RandomHorizontalFlip(p=flip_p),
-            v2.Resize(size=(640, 640)),
-            v2.SanitizeBoundingBoxes(min_size=1.0),
-        ]
-    )
+    steps: list = [
+        *photometric_steps,
+        v2.RandomZoomOut(fill=zoomout_fill, p=zoomout_p),
+        v2.RandomApply([v2.RandomIoUCrop()], p=iou_crop_p),
+        v2.SanitizeBoundingBoxes(min_size=1.0),
+        v2.RandomHorizontalFlip(p=flip_p),
+    ]
+    if final_stretch_resize:
+        steps.extend([v2.Resize(size=(640, 640)), v2.SanitizeBoundingBoxes(min_size=1.0)])
+    return v2.Compose(steps)
 
 
 def _scalar_ann_field(v):
@@ -818,6 +825,7 @@ def make_train_collate_fn(
             iou_crop_p=det_params.iou_crop_p,
             flip_p=det_params.flip_p,
             photometric_magnitude=det_params.photometric_magnitude,
+            final_stretch_resize=not uses_letterbox(),
         )
 
     def collate(batch):
@@ -843,6 +851,8 @@ def make_train_collate_fn(
                 pass
             else:
                 raise ValueError(f"未知 aug_level 内部模式: {mode}")
+            if uses_letterbox():
+                img, tgt = letterbox_pil_coco(img, tgt)
             images.append(img)
             annotations.append({"image_id": image_id, "annotations": tgt})
         return _collate_processor_batch(images, annotations, processor)
@@ -1289,18 +1299,34 @@ def move_labels_to_device(labels: list[dict], device: torch.device) -> list[dict
 
 
 def collate_infer_only(batch):
-    """推理用：只做 resize/normalize，不读标注。"""
+    """推理/验证：stretch 为原图尺寸；letterbox 为先 pad 到 INPUT_SIZE 再交给 processor。"""
     images = []
     target_sizes = []
     image_ids = []
+    letterbox_meta: list[dict | None] = []
     for img, image_id, _ in batch:
         if img.mode != "RGB":
             img = img.convert("RGB")
+        orig_w, orig_h = img.size
+        if uses_letterbox():
+            img, _ = letterbox_pil_coco(img, [])
+            ratio, _, _, pad_w, pad_h = letterbox_params(orig_w, orig_h, pc.INPUT_SIZE)
+            letterbox_meta.append(
+                {
+                    "ratio": ratio,
+                    "pad_w": pad_w,
+                    "pad_h": pad_h,
+                    "orig_w": orig_w,
+                    "orig_h": orig_h,
+                }
+            )
+            target_sizes.append((pc.INPUT_SIZE, pc.INPUT_SIZE))
+        else:
+            letterbox_meta.append(None)
+            target_sizes.append((orig_h, orig_w))
         images.append(img)
-        w, h = img.size
-        target_sizes.append((h, w))
         image_ids.append(image_id)
-    return images, torch.tensor(target_sizes, dtype=torch.int64), image_ids
+    return images, torch.tensor(target_sizes, dtype=torch.int64), image_ids, letterbox_meta
 
 
 def _xyxy_to_xywh(box: torch.Tensor) -> list[float]:
@@ -1331,7 +1357,7 @@ def evaluate_coco_bbox_map(
         pin_memory=device.type == "cuda",
     )
     predictions: list[dict] = []
-    for images, target_sizes_cpu, image_ids in loader:
+    for images, target_sizes_cpu, image_ids, lb_meta in loader:
         enc = processor(images=list(images), return_tensors="pt")
         pixel_values = enc["pixel_values"].to(device)
         target_sizes = target_sizes_cpu.to(device)
@@ -1342,7 +1368,7 @@ def evaluate_coco_bbox_map(
         results = processor.post_process_object_detection(
             outputs, threshold=score_threshold, target_sizes=target_sizes
         )
-        for img_id, res in zip(image_ids, results):
+        for img_id, res, meta in zip(image_ids, results, lb_meta):
             scores = res["scores"]
             labels = res["labels"]
             boxes = res["boxes"]
@@ -1356,11 +1382,24 @@ def evaluate_coco_bbox_map(
                     coco_cid = label_to_coco_id[lab_i]
                 else:
                     coco_cid = lab_i
+                if meta is not None:
+                    xyxy = letterbox_inverse_xyxy(
+                        box.cpu().numpy(),
+                        ratio=meta["ratio"],
+                        pad_w=meta["pad_w"],
+                        pad_h=meta["pad_h"],
+                        orig_w=meta["orig_w"],
+                        orig_h=meta["orig_h"],
+                    )
+                    x1, y1, x2, y2 = (float(v) for v in xyxy)
+                    bbox_xywh = [x1, y1, max(0.0, x2 - x1), max(0.0, y2 - y1)]
+                else:
+                    bbox_xywh = _xyxy_to_xywh(box.cpu())
                 predictions.append(
                     {
                         "image_id": int(img_id),
                         "category_id": coco_cid,
-                        "bbox": _xyxy_to_xywh(box.cpu()),
+                        "bbox": bbox_xywh,
                         "score": float(s),
                     }
                 )
