@@ -34,7 +34,7 @@ INPUT_SIZE = 640
 
 # "stretch" | "letterbox"
 
-RESIZE_MODE: Literal["stretch", "letterbox"] = "letterbox"
+RESIZE_MODE: Literal["stretch", "letterbox"] = "stretch"
 
 
 
