@@ -2,6 +2,7 @@
 /datasets/
 /outputs/
 /onnx_models/
-/scripts/
+/.scripts/
+/images/
 *__pycache__/
 test.ipynb

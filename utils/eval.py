@@ -921,7 +921,7 @@ def eval_model_on_datasets(
                         dataset_name=spec.name,
                         split="train",
                         vis_conf=vis_conf,
-                        nms_thres=1.0,
+                        nms_thres=args.nms,
                     )
                 )
             elif not args.val_only:
@@ -940,7 +940,7 @@ def eval_model_on_datasets(
                         dataset_name=spec.name,
                         split="val",
                         vis_conf=vis_conf,
-                        nms_thres=1.0,
+                        nms_thres=args.nms,
                     )
                 )
             else:
