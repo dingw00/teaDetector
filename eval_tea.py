@@ -8,9 +8,12 @@
     python eval_tea.py
     python eval_tea.py --model onnx_models/a.onnx outputs/deimv2_s/final
     python eval_tea.py --conf 0.2 --nms 0.3 --val_only
+    python eval_tea.py --vis_num 8
+    python eval_tea.py --vis_num all
     python eval_tea.py --vis-conf deimv2_l_march:0.35 dino_0329_30:0.15
-    # HF mAP：MAP_SCORE_THRESHOLD + 与 train_tea 相同后处理（无额外 NMS）
+    # HF/ONNX mAP：后处理 score 下限固定为 0（无额外 NMS）；与 train_tea 一致
     # --nms / NMS_THRESHOLD 仅用于 vis/ 抽样图；--conf / --vis-conf 为 vis 绘制 score 下限
+    # --vis_num N|all：仅 val 可视化抽样张数；train 固定 2 张
     # 中断后续跑（跳过已完成模型）：
     python eval_tea.py --output_dir outputs/eval/20260517_151507
     python eval_tea.py --resume outputs/eval/20260517_151507
@@ -22,6 +25,7 @@
 配置：configs/eval.py（DATASETS、MODELS、阈值等）。
 可视化抽样由 --seed 固定，不同模型对同一数据集/划分抽取相同图片。
 vis/ 下每张抽样图输出一张竖排多模型对比图（subtitle：数据集 | train/val | 图像名 | 模型）。
+框上文字不含类别名（GT / 分数），并自动夹在图像边界内。
 """
 
 from __future__ import annotations
@@ -56,6 +60,28 @@ from utils.preprocess import add_preprocess_arguments, apply_preprocess_from_nam
 
 def model_display_stems(model_paths: list[Path]) -> list[str]:
     return [display_model_name(p, detect_backend(p)) for p in model_paths]
+
+
+def _parse_vis_num(value: str | int | None) -> int | None:
+    """解析 --vis_num / VIS_NUM_IMAGES：正整数或 all（返回 None 表示 val 全部）。"""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        if value < 1:
+            raise argparse.ArgumentTypeError(f"--vis_num 须 ≥1 或为 all，收到: {value!r}")
+        return value
+    s = str(value).strip().lower()
+    if s in ("all", "*"):
+        return None
+    try:
+        n = int(s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--vis_num 应为正整数或 all，收到: {value!r}"
+        ) from exc
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"--vis_num 须 ≥1 或为 all，收到: {value!r}")
+    return n
 
 
 def parse_args(argv: list[str] | None = None):
@@ -95,14 +121,17 @@ def parse_args(argv: list[str] | None = None):
             "例如 deimv2_l_march:0.35；亦可在 configs/eval.VIS_CONF_BY_MODEL 配置"
         ),
     )
-    p.add_argument(
-        "--map_conf",
-        type=float,
-        default=None,
-        help=f"仅 mAP：推理后处理 score 下限（宜低以保留 P-R 候选）；默认 {cfg.MAP_SCORE_THRESHOLD}",
-    )
     p.add_argument("--nms", type=float, default=cfg.NMS_THRESHOLD)
-    p.add_argument("--vis_num", type=int, default=cfg.VIS_NUM_IMAGES)
+    p.add_argument(
+        "--vis_num",
+        type=_parse_vis_num,
+        default=_parse_vis_num(cfg.VIS_NUM_IMAGES),
+        metavar="N|all",
+        help=(
+            "仅 val 划分抽样可视化张数；传 all 表示 val 全部图片。"
+            f"train 固定 2 张。默认 {cfg.VIS_NUM_IMAGES}"
+        ),
+    )
     p.add_argument("--seed", type=int, default=cfg.RANDOM_SEED)
     p.add_argument("--run_name", type=str, default=None)
     p.add_argument("--val_only", action="store_true")
@@ -160,12 +189,14 @@ def main(argv: list[str] | None = None):
         raise SystemExit("--redraw-vis 需指定已有评测 run（--output_dir 或 --resume 指向含 metrics_*.json 的目录）")
     print(f"模型数量: {len(model_paths)}，数据集: {[s.name for s in specs]}")
     vis_conf_default = args.conf if args.conf is not None else cfg.CONF_THRESHOLD
-    map_conf = args.map_conf if args.map_conf is not None else cfg.MAP_SCORE_THRESHOLD
     cli_vis_conf = parse_vis_conf_specs(args.vis_conf)
     config_vis_conf = dict(getattr(cfg, "VIS_CONF_BY_MODEL", {}) or {})
-    print(f"可视化 seed={args.seed}，每划分 {args.vis_num} 张（全模型共用抽样）")
+    vis_num_disp = "all" if args.vis_num is None else str(args.vis_num)
     print(
-        f"HF mAP score≥{map_conf:g}（与 train_tea 一致，无额外 NMS）；"
+        f"可视化 seed={args.seed}，train 固定 2 张，val {vis_num_disp} 张（全模型共用抽样）"
+    )
+    print(
+        f"mAP 后处理 score≥0（与 train_tea 一致，无额外 NMS）；"
         f"vis 默认 score≥{vis_conf_default:g}，vis NMS={args.nms:g}"
     )
     if config_vis_conf or cli_vis_conf:
@@ -186,7 +217,7 @@ def main(argv: list[str] | None = None):
                 cli_map=cli_vis_conf,
             )
             redraw_vis_for_model(
-                model_path, specs, vis_plan, run_output_dir, args, vis_conf, map_conf, vis_accum
+                model_path, specs, vis_plan, run_output_dir, args, vis_conf, vis_accum
             )
             update_model_vis_conf(models_results, model_path, vis_conf)
     else:
@@ -209,7 +240,7 @@ def main(argv: list[str] | None = None):
             )
             models_results.append(
                 eval_model_on_datasets(
-                    model_path, specs, vis_plan, run_output_dir, args, vis_conf, map_conf, vis_accum
+                    model_path, specs, vis_plan, run_output_dir, args, vis_conf, vis_accum
                 )
             )
 
@@ -238,7 +269,6 @@ def main(argv: list[str] | None = None):
                 }
                 for s in specs
             ],
-            "map_score_threshold": map_conf,
             "vis_conf_default": vis_conf_default,
             "vis_conf_by_model": {**config_vis_conf, **cli_vis_conf},
             "conf_threshold": vis_conf_default,
@@ -246,7 +276,8 @@ def main(argv: list[str] | None = None):
             "nms_for_vis_only": True,
             "device": args.device,
             "input_size": pc.INPUT_SIZE,
-            "vis_num": args.vis_num,
+            "vis_num": "all" if args.vis_num is None else args.vis_num,
+            "vis_num_train": 2,
             "vis_seed": args.seed,
             "val_only": args.val_only,
             "map_iou_thresholds": list(cfg.MAP_IOU_THRESHOLDS),

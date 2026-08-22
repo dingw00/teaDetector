@@ -10,7 +10,7 @@ from PIL import Image
 from transformers import AutoImageProcessor
 
 from configs import preprocess as pc
-from utils.common import as_pretrained_identifier
+from utils.common import as_pretrained_identifier, from_pretrained_with_local_fallback
 
 
 def uses_letterbox() -> bool:
@@ -142,7 +142,9 @@ def _is_local_checkpoint_dir(path: Path) -> bool:
 
 def load_deimv2_processor(model_id_or_path: str | Path) -> AutoImageProcessor:
     load_target = as_pretrained_identifier(model_id_or_path)
-    processor = AutoImageProcessor.from_pretrained(load_target)
+    processor = from_pretrained_with_local_fallback(
+        AutoImageProcessor.from_pretrained, load_target
+    )
 
     local_dir = Path(model_id_or_path) if isinstance(model_id_or_path, Path) else Path(load_target)
     use_saved = _is_local_checkpoint_dir(local_dir) and pc.USE_CHECKPOINT_PREPROCESSOR
@@ -170,7 +172,6 @@ def describe_processor(processor: AutoImageProcessor) -> str:
     else:
         parts.append("无 mean/std 归一化")
     return " → ".join(parts)
-
 
 # ---------------------------------------------------------------------------
 # CLI 覆盖 configs/preprocess.py

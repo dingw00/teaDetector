@@ -1,6 +1,6 @@
-# teaDetector
+# teabud-detect
 
-**Languages / 语言：** [简体中文](README.md) · [English](README.en.md)
+**Languages / 语言：** [简体中文](README.cn.md) · [English](README.md)
 
 Detect tea buds in field images (object detection), with an end-to-end workflow for training, evaluation, export, and deployment.
 
@@ -51,7 +51,7 @@ The first run downloads DEIMv2 pretrained weights from Hugging Face (`--pretrain
 ## Layout (essentials)
 
 ```
-teaDetector/
+teabud-detect/
 ├── configs/          # Defaults for train / eval / preprocess / export
 ├── datasets/         # COCO roots, e.g. teabud_march_ztu, teabud_april
 ├── outputs/          # Checkpoints, eval runs, curve plots
@@ -129,7 +129,8 @@ Artifacts under `--output_dir`:
 
 - `checkpoint-epochN/` — per-epoch snapshot; `final/` mirrors the latest for resume after interrupt
 - `checkpoint-best/` — best val bbox mAP
-- `train_metrics.json` — for `plot_train_curves.py`
+- `training_run.json` — run summary; `sessions[]` appends each launch (config/CLI/epoch range/session best); top-level `best` is global
+- `checkpoint-epochN/train_metrics.json` — per-epoch loss/mAP for `plot_train_curves.py`
 
 ---
 

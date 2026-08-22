@@ -57,12 +57,21 @@ def resolve_dataset_specs() -> list[DatasetSpec]:
     for entry in cfg.DATASETS:
         root = Path(entry["root"])
         name = entry.get("name", root.name)
+        train_ann = Path(entry["train_ann"]) if entry.get("train_ann") else root / "annotations" / "train.json"
+        if entry.get("val_ann"):
+            val_ann = Path(entry["val_ann"])
+        else:
+            val_ann = root / "annotations" / "val.json"
+            if not val_ann.is_file():
+                alt = root / "annotations" / "valid.json"
+                if alt.is_file():
+                    val_ann = alt
         specs.append(
             DatasetSpec(
                 name=name,
                 image_dir=root / "images",
-                train_ann=root / "annotations" / "train.json",
-                val_ann=root / "annotations" / "val.json",
+                train_ann=train_ann,
+                val_ann=val_ann,
             )
         )
     return specs
@@ -104,14 +113,57 @@ def load_coco(name: str, ann_path: Path, image_dir: Path) -> CocoDataset:
     )
 
 
-def resolve_image_path(image_dir: Path, file_name: str) -> Path:
-    path = image_dir / file_name
-    if path.exists():
-        return path
-    matches = list(image_dir.rglob(Path(file_name).name))
-    if matches:
-        return matches[0]
-    raise FileNotFoundError(f"找不到图片：{file_name}，搜索目录：{image_dir}")
+def resolve_image_path(
+    image_dir: Path,
+    file_name: str,
+    *,
+    split: str | None = None,
+) -> Path:
+    """在 image_dir 下解析图片路径。
+
+    image_dir 本身保持为数据集的 images/ 目录；若给定 split（train/val），
+    优先在 image_dir/split/ 子目录中查找（val 亦尝试 valid/）。
+    """
+    name = Path(file_name).name
+    candidates: list[Path] = []
+
+    if split:
+        split_key = str(split).strip().lower()
+        split_dirs = [image_dir / split_key]
+        if split_key == "val":
+            split_dirs.append(image_dir / "valid")
+        for sd in split_dirs:
+            candidates.append(sd / file_name)
+            candidates.append(sd / name)
+
+    candidates.append(image_dir / file_name)
+    candidates.append(image_dir / name)
+
+    # 标注写 images/xxx.png，而 image_dir 已是 .../images 时去掉一层前缀
+    fn_path = Path(file_name)
+    if len(fn_path.parts) > 1 and fn_path.parts[0].lower() in {"images", "image"}:
+        candidates.append(image_dir / Path(*fn_path.parts[1:]))
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    search_dirs: list[Path] = []
+    if split:
+        split_key = str(split).strip().lower()
+        search_dirs.append(image_dir / split_key)
+        if split_key == "val":
+            search_dirs.append(image_dir / "valid")
+    search_dirs.append(image_dir)
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        matches = list(d.rglob(name))
+        if matches:
+            return matches[0]
+
+    hint = f"{image_dir}/{split}" if split else str(image_dir)
+    raise FileNotFoundError(f"找不到图片：{file_name}，搜索目录：{hint}")
 
 
 # ========================================================================
@@ -269,22 +321,39 @@ def vis_split_seed(base_seed: int, dataset_name: str, split: str) -> int:
     return (base_seed + h) % (2**31 - 1)
 
 
-def pick_vis_image_infos(dataset: CocoDataset, vis_num: int, seed: int) -> list[dict]:
+def pick_vis_image_infos(dataset: CocoDataset, vis_num: int | None, seed: int) -> list[dict]:
+    """vis_num 为 None 表示该划分全部图片；否则随机抽 min(vis_num, N) 张。"""
+    images = list(dataset.images)
+    if not images:
+        return []
+    if vis_num is None or vis_num >= len(images):
+        return images
     rng = random.Random(seed)
-    return rng.sample(dataset.images, k=min(vis_num, len(dataset.images)))
+    return rng.sample(images, k=vis_num)
+
+
+# train 可视化抽样张数固定；--vis_num / VIS_NUM_IMAGES 仅作用于 val。
+_TRAIN_VIS_NUM_IMAGES = 2
 
 
 def build_vis_plan(
-    specs: list[DatasetSpec], vis_num: int, base_seed: int, val_only: bool
+    specs: list[DatasetSpec], vis_num: int | None, base_seed: int, val_only: bool
 ) -> dict[str, dict[str, list[dict]]]:
-    """dataset -> split -> [{id, file_name}, ...]，全模型共用。"""
+    """dataset -> split -> [{id, file_name}, ...]，全模型共用。
+
+    vis_num 仅控制 val（None=全部）；train 固定抽 ``_TRAIN_VIS_NUM_IMAGES`` 张。
+    """
     plan: dict[str, dict[str, list[dict]]] = {}
     for spec in specs:
         plan[spec.name] = {}
         if not val_only:
             if spec.train_ann.exists():
                 train_ds = load_coco("train", spec.train_ann, spec.image_dir)
-                infos = pick_vis_image_infos(train_ds, vis_num, vis_split_seed(base_seed, spec.name, "train"))
+                infos = pick_vis_image_infos(
+                    train_ds,
+                    _TRAIN_VIS_NUM_IMAGES,
+                    vis_split_seed(base_seed, spec.name, "train"),
+                )
                 plan[spec.name]["train"] = [
                     {"id": int(i["id"]), "file_name": i["file_name"]} for i in infos
                 ]
@@ -303,7 +372,29 @@ def _vis_draw_scale(height: int, width: int) -> float:
     return min(1.35, max(1.0, min(height, width) / 800.0))
 
 
-def render_boxes_bgr(image_bgr, preds, gts, category_names) -> np.ndarray:
+def _put_text_clamped(
+    image: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    font,
+    font_scale: float,
+    color,
+    thickness: int,
+    line_type: int,
+) -> None:
+    """在图像内绘制文字；若超出边界则平移到可见区域。"""
+    h, w = image.shape[:2]
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    # putText 的 y 为基线：文字约占 [y - th, y + baseline]
+    x = int(np.clip(x, 0, max(0, w - tw)))
+    y = int(np.clip(y, th, max(th, h - baseline)))
+    cv2.putText(image, text, (x, y), font, font_scale, color, thickness, line_type)
+
+
+def render_boxes_bgr(image_bgr, preds, gts, category_names=None) -> np.ndarray:
+    """绘制 GT（绿）与预测框（橙）。标签不含类别名，仅 GT / 分数。"""
+    _ = category_names  # 兼容旧调用签名，vis 不再显示类别名
     image = image_bgr.copy()
     h, w = image.shape[:2]
     scale = _vis_draw_scale(h, w)
@@ -315,34 +406,19 @@ def render_boxes_bgr(image_bgr, preds, gts, category_names) -> np.ndarray:
 
     for gt in gts:
         x1, y1, x2, y2 = [int(round(v)) for v in gt["bbox"]]
-        name = category_names.get(gt["category_id"], str(gt["category_id"]))
-        suffix = " [crowd]" if gt.get("iscrowd") else ""
+        text = "GT[crowd]" if gt.get("iscrowd") else "GT"
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 220, 0), box_thickness)
-        label_y = max(int(16 * scale), y1 - int(5 * scale))
-        cv2.putText(
-            image,
-            f"GT:{name}{suffix}",
-            (x1, label_y),
-            font,
-            font_scale,
-            (0, 220, 0),
-            text_thickness,
-            line_type,
+        label_y = y1 - int(5 * scale)
+        _put_text_clamped(
+            image, text, x1, label_y, font, font_scale, (0, 220, 0), text_thickness, line_type
         )
     for pred in preds:
         x1, y1, x2, y2 = [int(round(v)) for v in pred["bbox"]]
-        name = category_names.get(pred["category_id"], str(pred["category_id"]))
+        text = f"{pred['score']:.2f}"
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 80, 255), box_thickness)
-        label_y = min(h - int(4 * scale), y2 + int(16 * scale))
-        cv2.putText(
-            image,
-            f"P:{name} {pred['score']:.2f}",
-            (x1, label_y),
-            font,
-            font_scale,
-            (0, 80, 255),
-            text_thickness,
-            line_type,
+        label_y = y2 + int(16 * scale)
+        _put_text_clamped(
+            image, text, x1, label_y, font, font_scale, (0, 80, 255), text_thickness, line_type
         )
     return image
 
@@ -468,7 +544,7 @@ def visualize_by_ids(
 ):
     id_to_info = {int(i["id"]): i for i in image_infos}
     for image_id, img_info in id_to_info.items():
-        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"], split=dataset.name)
         image_bgr = cv2.imread(str(path))
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
@@ -558,7 +634,9 @@ def infer_dataset_hf(
 
         def __getitem__(self, idx: int):
             img_info = self.coco_ds.images[idx]
-            path = resolve_image_path(self.coco_ds.image_dir, img_info["file_name"])
+            path = resolve_image_path(
+                self.coco_ds.image_dir, img_info["file_name"], split=self.coco_ds.name
+            )
             image = Image.open(path).convert("RGB")
             w, h = image.size
             return image, torch.tensor([h, w], dtype=torch.int64), int(img_info["id"])
@@ -612,7 +690,7 @@ def infer_vis_images_hf(
     preds_by_image: dict[int, list] = {}
     id_to_info = {int(i["id"]): i for i in image_infos}
     for image_id, img_info in id_to_info.items():
-        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"], split=dataset.name)
         image = Image.open(path).convert("RGB")
         w, h = image.size
         target_sizes = torch.tensor([[h, w]], dtype=torch.int64, device=device)
@@ -803,7 +881,7 @@ def infer_dataset_onnx(spec: OnnxDeploySpec, dataset: CocoDataset, conf: float) 
     """全量 mAP 推理：与 HF 一致，仅 score 阈值，不做 NMS。"""
     preds_by_image = {}
     for img_info in dataset.images:
-        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"], split=dataset.name)
         image_bgr = cv2.imread(str(path))
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
@@ -816,7 +894,7 @@ def infer_vis_images_onnx(
 ) -> dict[int, list]:
     preds_by_image: dict[int, list] = {}
     for img_info in image_infos:
-        path = resolve_image_path(dataset.image_dir, img_info["file_name"])
+        path = resolve_image_path(dataset.image_dir, img_info["file_name"], split=dataset.name)
         image_bgr = cv2.imread(str(path))
         if image_bgr is None:
             raise RuntimeError(f"无法读取图片：{path}")
@@ -865,22 +943,22 @@ def eval_model_on_datasets(
     run_output_dir: Path,
     args,
     vis_conf: float,
-    map_conf: float,
     vis_accum: VisPanelAccumulator | None = None,
 ) -> dict[str, Any]:
     backend = detect_backend(model_path)
     model_stem = display_model_name(model_path, backend)
     datasets_out: dict[str, dict[str, dict]] = {}
+    map_conf = 0.0
 
     print(f"\n{'=' * 60}\n模型: {model_path} ({backend})\n{'=' * 60}")
     if backend == "checkpoint":
         print(
-            f"mAP score≥{map_conf:g}（HF 后处理，与 train_tea 一致，无额外 NMS）；"
+            f"mAP score≥0（HF 后处理，与 train_tea 一致，无额外 NMS）；"
             f"vis score≥{vis_conf:g}，NMS={args.nms:g}"
         )
     else:
         print(
-            f"mAP score≥{map_conf:g}（ONNX 后处理，与 HF 一致，无额外 NMS）；"
+            f"mAP score≥0（ONNX 后处理，与 HF 一致，无额外 NMS）；"
             f"vis score≥{vis_conf:g}，NMS={args.nms:g}"
         )
 
@@ -953,7 +1031,6 @@ def eval_model_on_datasets(
             "name": model_stem,
             "path": str(model_path),
             "backend": backend,
-            "map_score_threshold": map_conf,
             "vis_conf_threshold": vis_conf,
             "conf_threshold": vis_conf,
             "onnx_mode": onnx_spec.mode,
@@ -1036,7 +1113,6 @@ def eval_model_on_datasets(
         "name": model_stem,
         "path": str(model_path),
         "backend": backend,
-        "map_score_threshold": map_conf,
         "vis_conf_threshold": vis_conf,
         "conf_threshold": vis_conf,
         "device": str(device),
@@ -1104,7 +1180,6 @@ def redraw_vis_for_model(
     run_output_dir: Path,
     args,
     vis_conf: float,
-    map_conf: float,
     vis_accum: VisPanelAccumulator | None = None,
 ) -> None:
     """仅对 vis 抽样图重新推理并覆盖 vis/，不重新计算 mAP。"""
@@ -1112,6 +1187,8 @@ def redraw_vis_for_model(
         return
     backend = detect_backend(model_path)
     model_stem = display_model_name(model_path, backend)
+    # 先以 score≥0 取候选，再按 vis_conf / NMS 过滤绘制
+    map_conf = 0.0
 
     print(f"\n{'=' * 60}\n[重绘 vis] 模型: {model_path} ({backend})\n{'=' * 60}")
     print(f"vis 重绘 score≥{vis_conf:g}，NMS={args.nms:g}")
@@ -1467,12 +1544,9 @@ def _draw_heatmap_ax(ax, values: np.ndarray, model_names: list[str], x_labels: l
 
 
 def format_chart_eval_params(report: dict[str, Any]) -> str:
-    """评测超参脚注（mAP/vis 阈值、NMS 等），绘制在 charts 图内。"""
+    """评测超参脚注（vis 阈值、NMS 等），绘制在 charts 图内。"""
     ep = report.get("eval_params") or {}
     parts: list[str] = []
-    map_thr = ep.get("map_score_threshold")
-    if map_thr is not None:
-        parts.append(f"mAP score≥{float(map_thr):g}")
     vis_thr = ep.get("vis_conf_threshold")
     if vis_thr is None:
         vis_thr = ep.get("conf_threshold")
@@ -1604,7 +1678,8 @@ def plot_combined_comparison_figure(report: dict[str, Any], charts_dir: Path) ->
         )
         fig.colorbar(im, ax=ax, fraction=0.046)
 
-    fig.tight_layout(rect=[0, 0.05, 1, 0.98])
+    # GridSpec + colorbar 与 tight_layout 不兼容，用边距预留脚注
+    fig.subplots_adjust(left=0.06, right=0.98, top=0.97, bottom=0.05)
     _stamp_chart_eval_params(fig, report, bottom=0.01)
     out_path = charts_dir / "compare_combined.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1649,7 +1724,8 @@ def plot_metric_heatmaps(report: dict[str, Any], charts_dir: Path):
         im = _draw_heatmap_ax(ax, values, model_names, x_labels, f"{display} (model × dataset/split)")
         fig.colorbar(im, ax=ax, fraction=0.046)
 
-    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    # colorbar 轴与 tight_layout 不兼容
+    fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.12, wspace=0.28)
     _stamp_chart_eval_params(fig, report, bottom=0.02)
     heat_path = charts_dir / "heatmap_AP50_mAP50_95.png"
     fig.savefig(heat_path, dpi=150)

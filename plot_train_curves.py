@@ -2,6 +2,8 @@
 从 outputs 下各 checkpoint-epoch*/train_metrics.json 读取指标并绘制曲线。
 
 每个训练 run 生成一张图（3 行子图）：训练损失、检测 mAP（IoU 0.50:0.95）、检测 mAP@0.5。
+图注优先读取同目录 training_run.json（sessions）；若某设定跨段变化，按
+「epoch a–b: …; epoch c–d: …」列出。无 training_run.json 时回退到末轮 train_metrics。
 
 默认输出到 outputs/train_curves/（与 outputs/eval 同级）。epoch 数 >100 时不画 marker。
 

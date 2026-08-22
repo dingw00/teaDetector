@@ -27,6 +27,9 @@ checkpoint-best 的基准（若无则从零开始比较）。
 
 每轮结束会写入 checkpoint-epochN，并同步到 final/（与最近一轮权重一致，便于中断后续训仍可用）。
 验证集 bbox mAP 创新高时另存 checkpoint-best/。
+每次训练在 output_dir/training_run.json 的 sessions[] 中追加一条会话记录（不覆盖历史）：
+configs 全量参数、命令行覆盖项、本次 epoch 起止、该会话最佳指标、起点模型；
+顶层 best 为所有会话中的全局最佳。
 
 依赖：torch, torchvision, transformers, scipy（Hungarian 匹配需要）, pycocotools（验证 mAP）
 
@@ -43,7 +46,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -57,7 +62,7 @@ from transformers.utils import logging as hf_logging
 
 import configs.augmentation as _aug
 import configs.train as _tc
-from utils.common import HF_DEIMV2_PRESETS, resolve_pretrained_hub_id
+from utils.common import HF_DEIMV2_PRESETS, from_pretrained_with_local_fallback, resolve_pretrained_hub_id
 from utils.preprocess import (
     add_preprocess_arguments,
     apply_preprocess_from_namespace,
@@ -81,17 +86,24 @@ from utils.train import (
     apply_train_mode,
     augmentation_metrics_block,
     build_adamw_param_groups,
+    _AUG_FLAT_EFFECTIVE_KEYS,
+    begin_training_run_session,
+    build_best_summary,
     build_train_val_sources,
     config_num_labels,
     evaluate_coco_bbox_map,
     evaluate_val_maps_per_dataset,
+    flush_training_run_session,
+    format_epoch_metric_line,
     resolve_categories_from_dataset_roots,
     format_augmentation_log_line,
+    json_safe,
     make_train_collate_fn,
     move_labels_to_device,
     parse_aug_level,
     resolve_cli_path,
     resolve_train_mosaic_p,
+    snapshot_preprocess_config,
     sync_optimizer_param_group_metadata,
     _dinov3_vit_num_hidden_layers,
 )
@@ -118,7 +130,6 @@ _TC_ARG_FIELDS: tuple[tuple[str, str], ...] = (
     ("weight_decay", "WEIGHT_DECAY"),
     ("warmup_epochs", "WARMUP_EPOCHS"),
     ("device", "DEVICE"),
-    ("map_score_threshold", "MAP_SCORE_THRESHOLD"),
     ("map_batch_size", "MAP_BATCH_SIZE"),
     ("aug_level", "AUG_LEVEL"),
     ("aug_simple_flip_p", "AUG_SIMPLE_FLIP_P"),
@@ -168,6 +179,94 @@ def _training_defaults(preset: str | None) -> dict[str, object]:
     for key, val in overlay.items():
         cfg[key] = list(val) if key == "datasets" else val
     return cfg
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# argparse dest → 可能出现在 argv 中的选项名（用于识别真正的 CLI 覆盖）
+_CLI_DEST_FLAGS: dict[str, tuple[str, ...]] = {
+    "preset": ("--preset",),
+    "datasets": ("--datasets",),
+    "dataset_ratios": ("--dataset_ratios",),
+    "output_dir": ("--output_dir",),
+    "epochs": ("--epochs",),
+    "batch_size": ("--batch_size",),
+    "lr": ("--lr",),
+    "pretrained": ("--pretrained",),
+    "num_workers": ("--num_workers",),
+    "train_mode": ("--train_mode",),
+    "loss_bbox_scale": ("--loss_bbox_scale",),
+    "unfreeze_backbone_last_n": ("--unfreeze_backbone_last_n",),
+    "lr_backbone": ("--lr_backbone",),
+    "backbone_lr_decay": ("--backbone_lr_decay",),
+    "weight_decay": ("--weight_decay",),
+    "warmup_epochs": ("--warmup_epochs",),
+    "device": ("--device",),
+    "map_batch_size": ("--map_batch_size",),
+    "resume_from": ("--resume_from",),
+    "aug_level": ("--aug_level",),
+    "aug_simple_flip_p": ("--aug_simple_flip_p",),
+    "aug_simple_color_p": ("--aug_simple_color_p",),
+    "aug_det_photometric_p": ("--aug_det_photometric_p",),
+    "aug_det_zoomout_fill": ("--aug_det_zoomout_fill",),
+    "aug_det_zoomout_p": ("--aug_det_zoomout_p",),
+    "aug_det_iou_crop_p": ("--aug_det_iou_crop_p",),
+    "aug_det_flip_p": ("--aug_det_flip_p",),
+    "aug_det_mosaic_p": ("--aug_det_mosaic_p",),
+    "input_size": ("--input_size",),
+    "resize_mode": ("--resize-mode", "--resize_mode"),
+    "do_rescale": ("--do_rescale", "--no-do_rescale", "--no_do_rescale"),
+    "do_normalize": ("--do_normalize", "--no-do_normalize", "--no_do_normalize"),
+    "image_mean": ("--image_mean",),
+    "image_std": ("--image_std",),
+    "use_checkpoint_preprocessor": (
+        "--use_checkpoint_preprocessor",
+        "--no-use_checkpoint_preprocessor",
+        "--no_use_checkpoint_preprocessor",
+    ),
+    "force_preprocess_config": ("--force_preprocess_config",),
+}
+
+
+def _argv_has_flag(argv: list[str], flags: tuple[str, ...]) -> bool:
+    for a in argv:
+        for f in flags:
+            if a == f or a.startswith(f + "="):
+                return True
+    return False
+
+
+def _collect_cli_overrides(args: argparse.Namespace, argv: list[str]) -> dict[str, object]:
+    """仅收录本次命令行显式传入的参数（相对 config/preset 默认的覆盖项）。"""
+    out: dict[str, object] = {}
+    for dest, flags in _CLI_DEST_FLAGS.items():
+        if not hasattr(args, dest):
+            continue
+        if not _argv_has_flag(argv, flags):
+            continue
+        val = getattr(args, dest)
+        if dest == "force_preprocess_config" and not val:
+            continue
+        out[dest] = val
+    return out
+
+
+def _effective_train_args(
+    args: argparse.Namespace,
+    *,
+    augmentation: dict | None = None,
+) -> dict[str, object]:
+    """最终生效配置（不含原始 config / 未使用的增强档位明细）。"""
+    eff: dict[str, object] = {"preset": args.preset}
+    for arg_name, _ in _TC_ARG_FIELDS:
+        if arg_name in _AUG_FLAT_EFFECTIVE_KEYS:
+            continue
+        eff[arg_name] = getattr(args, arg_name)
+    if augmentation is not None:
+        eff["augmentation"] = augmentation
+    return eff
 
 
 def parse_args(argv: list[str] | None = None):
@@ -281,12 +380,6 @@ def parse_args(argv: list[str] | None = None):
         default=device_default,
     )
     p.add_argument(
-        "--map_score_threshold",
-        type=float,
-        default=d["map_score_threshold"],
-        help="验证 mAP 时过滤低分框的阈值（与训练无关）",
-    )
-    p.add_argument(
         "--map_batch_size",
         type=int,
         default=d["map_batch_size"],
@@ -357,8 +450,11 @@ def parse_args(argv: list[str] | None = None):
     add_preprocess_arguments(p)
     return p.parse_args(argv_rest)
 
-def main():
-    args = parse_args()
+
+def main(argv: list[str] | None = None):
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+
+    args = parse_args(argv_list)
     prep_applied = apply_preprocess_from_namespace(args)
     if prep_applied:
         print("预处理 CLI 覆盖: " + ", ".join(prep_applied))
@@ -373,6 +469,8 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.warmup_epochs < 0:
         raise ValueError("--warmup_epochs 不能为负数")
+
+    cli_overrides = _collect_cli_overrides(args, argv_list)
 
     category_spec = resolve_categories_from_dataset_roots(args.datasets)
     print(
@@ -409,7 +507,8 @@ def main():
         print(f"从 HuggingFace Hub 加载预训练: {pretrained_hub}")
         processor = load_deimv2_processor(pretrained_hub)
         print(f"图像预处理: {describe_processor(processor)}  （配置见 configs/preprocess.py）")
-        model = Deimv2ForObjectDetection.from_pretrained(
+        model = from_pretrained_with_local_fallback(
+            Deimv2ForObjectDetection.from_pretrained,
             pretrained_hub,
             num_labels=category_spec.num_labels,
             ignore_mismatched_sizes=True,
@@ -419,6 +518,11 @@ def main():
         model.config.num_labels = category_spec.num_labels
 
     load_source = str(args.resume_from) if args.resume_from is not None else resolve_pretrained_hub_id(args.pretrained)
+    start_model_name = (
+        Path(args.resume_from).name
+        if args.resume_from is not None
+        else str(args.pretrained)
+    )
 
     apply_train_mode(model, args.train_mode, args.loss_bbox_scale)
     apply_dinov3_backbone_last_n_unfreeze(model, args.unfreeze_backbone_last_n)
@@ -580,8 +684,58 @@ def main():
             )
 
     next_epoch = start_epoch + 1
+    epoch_end_planned = int(args.epochs)
+    now_iso = _utc_now_iso()
+    session_body: dict = {
+        "status": "running",
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "finished_at": None,
+        "command": " ".join(["python", "train_tea.py", *argv_list]),
+        "preset": args.preset,
+        "cli_overrides": json_safe(cli_overrides),
+        "effective": {
+            **json_safe(_effective_train_args(args, augmentation=aug_record)),
+            "preprocess": snapshot_preprocess_config(),
+            "lr_backbone_effective": lr_backbone_eff,
+            "optimizer_layerwise_dinov3_backbone_lr": used_layerwise,
+            "dataset_roots": dataset_roots,
+            "num_labels": category_spec.num_labels,
+            "id2label": {str(k): v for k, v in category_spec.id2label.items()},
+        },
+        "start_model": {
+            "name": start_model_name,
+            "pretrained": args.pretrained,
+            "hub_id": None if args.resume_from is not None else resolve_pretrained_hub_id(args.pretrained),
+            "resume_from": str(args.resume_from) if args.resume_from is not None else None,
+            "load_source": load_source,
+        },
+        "epochs": {
+            "from": next_epoch,
+            "to": epoch_end_planned,
+            "completed_from": None,
+            "completed_to": None,
+            "resume_completed_before": start_epoch if args.resume_from is not None else 0,
+        },
+        "best": None,
+    }
+    run_record, session_record = begin_training_run_session(args.output_dir, session_body)
+
+    def _flush_run_record(*, status: str | None = None) -> None:
+        session_record["updated_at"] = _utc_now_iso()
+        flush_training_run_session(
+            args.output_dir, run_record, session_record, status=status
+        )
+
     if next_epoch > args.epochs:
         print(f"已完成 epoch {start_epoch}，且 >= --epochs {args.epochs}，无需继续训练。")
+        session_record["epochs"]["completed_from"] = None
+        session_record["epochs"]["completed_to"] = None
+        _flush_run_record(status="already_done")
+        print(
+            f"训练过程记录已追加会话 #{session_record.get('session_index', '?')} → "
+            f"{args.output_dir / 'training_run.json'}"
+        )
         return
 
     sync_optimizer_param_group_metadata(
@@ -621,159 +775,199 @@ def main():
                 f"val bbox mAP={best_val_bbox_map:.4f}"
             )
 
-    for epoch in range(next_epoch, args.epochs + 1):
-        m_warm = apply_backbone_linear_warmup_lrs(opt, epoch, args.warmup_epochs)
-        model.train()
-        running = 0.0
-        running_cls = 0.0
-        running_l1_bbox = 0.0
-        running_giou = 0.0
-        n_batches = 0
-        for batch in train_loader:
-            pixel_values = batch["pixel_values"].to(device)
-            labels = move_labels_to_device(batch["labels"], device)
-            kwargs = {"pixel_values": pixel_values, "labels": labels}
-            if "pixel_mask" in batch:
-                kwargs["pixel_mask"] = batch["pixel_mask"].to(device)
+    session_record["best"] = build_best_summary(
+        epoch=best_val_epoch,
+        val_bbox_map=best_val_bbox_map,
+    )
+    _flush_run_record(status="running")
+    print(
+        f"训练过程记录: {args.output_dir / 'training_run.json'} "
+        f"（会话 #{session_record.get('session_index', 0)}，已有 {len(run_record['sessions'])} 段）"
+    )
 
-            opt.zero_grad()
-            out = model(**kwargs)
-            loss = out.loss
-            loss.backward()
-            opt.step()
+    epoch = start_epoch
+    try:
+        for epoch in range(next_epoch, args.epochs + 1):
+            m_warm = apply_backbone_linear_warmup_lrs(opt, epoch, args.warmup_epochs)
+            model.train()
+            running = 0.0
+            running_cls = 0.0
+            running_l1_bbox = 0.0
+            running_giou = 0.0
+            n_batches = 0
+            for batch in train_loader:
+                pixel_values = batch["pixel_values"].to(device)
+                labels = move_labels_to_device(batch["labels"], device)
+                kwargs = {"pixel_values": pixel_values, "labels": labels}
+                if "pixel_mask" in batch:
+                    kwargs["pixel_mask"] = batch["pixel_mask"].to(device)
 
-            running += float(loss.detach())
-            ld = getattr(out, "loss_dict", None)
-            running_cls += _sum_weighted_cls_loss(ld)
-            running_l1_bbox += _sum_weighted_l1_bbox_loss(ld)
-            running_giou += _sum_weighted_giou_loss(ld)
-            n_batches += 1
+                opt.zero_grad()
+                out = model(**kwargs)
+                loss = out.loss
+                loss.backward()
+                opt.step()
 
-        train_loss = running / max(n_batches, 1)
-        train_loss_cls = running_cls / max(n_batches, 1)
-        train_loss_l1_bbox = running_l1_bbox / max(n_batches, 1)
-        train_loss_giou = running_giou / max(n_batches, 1)
+                running += float(loss.detach())
+                ld = getattr(out, "loss_dict", None)
+                running_cls += _sum_weighted_cls_loss(ld)
+                running_l1_bbox += _sum_weighted_l1_bbox_loss(ld)
+                running_giou += _sum_weighted_giou_loss(ld)
+                n_batches += 1
 
-        map_train = evaluate_coco_bbox_map(
-            model,
-            processor,
-            train_ds,
-            coco_gt_train,
-            device,
-            batch_size=map_bs,
-            score_threshold=args.map_score_threshold,
-            num_workers=args.num_workers,
-            label_to_coco_id=category_spec.label_to_coco_id,
-        )
-        map_val_per, map_val_mean = evaluate_val_maps_per_dataset(
-            model,
-            processor,
-            val_eval_sources,
-            device,
-            batch_size=map_bs,
-            score_threshold=args.map_score_threshold,
-            num_workers=args.num_workers,
-            label_to_coco_id=category_spec.label_to_coco_id,
-        )
-        map_val = map_val_mean if len(val_eval_sources) > 1 else next(iter(map_val_per.values()))
+            train_loss = running / max(n_batches, 1)
+            train_loss_cls = running_cls / max(n_batches, 1)
+            train_loss_l1_bbox = running_l1_bbox / max(n_batches, 1)
+            train_loss_giou = running_giou / max(n_batches, 1)
 
-        print(
-            f"epoch {epoch}: train_loss={train_loss:.4f} | cls≈{train_loss_cls:.4f} | "
-            f"bbox(L1)≈{train_loss_l1_bbox:.4f} | giou≈{train_loss_giou:.4f}"
-            + (f" | bb_warmup={m_warm:.3f}" if args.warmup_epochs > 0 else "")
-        )
-        print(
-            f"  train mAP={map_train['bbox_mAP']:.4f} mAP50={map_train['bbox_mAP_50']:.4f} "
-            f"mAP75={map_train['bbox_mAP_75']:.4f} AR100={map_train['bbox_mAR_100']:.4f}"
-        )
-
-        save_dir = args.output_dir / f"checkpoint-epoch{epoch}"
-        metrics = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_loss_cls_weighted": train_loss_cls,
-            "train_loss_bbox_l1_weighted": train_loss_l1_bbox,
-            "train_loss_giou_weighted": train_loss_giou,
-            "map_score_threshold": args.map_score_threshold,
-            "train_map": map_train,
-            "val_map": map_val,
-            "val_map_per_dataset": map_val_per,
-            "val_map_mean": map_val_mean if len(val_eval_sources) > 1 else None,
-            "train_mode": args.train_mode,
-            "unfreeze_backbone_last_n": args.unfreeze_backbone_last_n,
-            "warmup_epochs": args.warmup_epochs,
-            "backbone_warmup_mult": m_warm,
-            "pretrained": args.pretrained,
-            "load_source": load_source,
-            "dataset_roots": dataset_roots,
-            "num_labels": category_spec.num_labels,
-            "id2label": {str(k): v for k, v in category_spec.id2label.items()},
-            "coco_id_to_label": {str(k): v for k, v in category_spec.coco_id_to_label.items()},
-            "dataset_ratios": list(args.dataset_ratios) if args.dataset_ratios else None,
-            "train_sample_weights_enabled": train_sample_weights is not None,
-            "merged_coco_cache": str(merged_coco_cache) if merged_coco_cache is not None else None,
-            "optimizer": {
-                "layerwise_dinov3_backbone_lr": used_layerwise,
-                "lr": args.lr,
-                "lr_backbone": lr_backbone_eff if used_layerwise else None,
-                "backbone_lr_decay": args.backbone_lr_decay if used_layerwise else None,
-                "weight_decay": args.weight_decay,
-                "param_groups": len(param_groups),
-            },
-            "augmentation": augmentation_metrics_block(
-                args.aug_level,
-                simple_flip_p=args.aug_simple_flip_p,
-                simple_color_p=args.aug_simple_color_p,
-                det_photometric_p=args.aug_det_photometric_p,
-                det_zoomout_fill=args.aug_det_zoomout_fill,
-                det_zoomout_p=args.aug_det_zoomout_p,
-                det_iou_crop_p=args.aug_det_iou_crop_p,
-                det_flip_p=args.aug_det_flip_p,
-                mosaic_p=args.aug_det_mosaic_p,
-            ),
-            "loss_weights": {
-                "mal": model.config.weight_loss_mal,
-                "bbox": model.config.weight_loss_bbox,
-                "giou": model.config.weight_loss_giou,
-                "fgl": model.config.weight_loss_fgl,
-                "ddf": model.config.weight_loss_ddf,
-            },
-        }
-        _save_epoch_checkpoint(
-            save_dir,
-            model=model,
-            processor=processor,
-            metrics=metrics,
-            opt=opt,
-            epoch=epoch,
-            unfreeze_backbone_last_n=args.unfreeze_backbone_last_n,
-            warmup_epochs=args.warmup_epochs,
-            pretrained=args.pretrained,
-            load_source=load_source,
-        )
-        _promote_checkpoint_dir(save_dir, args.output_dir / "final")
-
-        val_bbox_map = _val_bbox_map(map_val if isinstance(map_val, dict) else None)
-        if val_bbox_map is not None and (
-            best_val_bbox_map is None or val_bbox_map >= best_val_bbox_map
-        ):
-            best_val_bbox_map = val_bbox_map
-            best_val_epoch = epoch
-            best_dir = args.output_dir / "checkpoint-best"
-            _promote_checkpoint_dir(save_dir, best_dir)
-            print(
-                f"  新最佳 val bbox mAP={val_bbox_map:.4f}，已保存到 {best_dir.name}/"
+            map_train = evaluate_coco_bbox_map(
+                model,
+                processor,
+                train_ds,
+                coco_gt_train,
+                device,
+                batch_size=map_bs,
+                num_workers=args.num_workers,
+                label_to_coco_id=category_spec.label_to_coco_id,
             )
+            map_val_per, map_val_mean = evaluate_val_maps_per_dataset(
+                model,
+                processor,
+                val_eval_sources,
+                device,
+                batch_size=map_bs,
+                num_workers=args.num_workers,
+                label_to_coco_id=category_spec.label_to_coco_id,
+            )
+            map_val = map_val_mean if len(val_eval_sources) > 1 else next(iter(map_val_per.values()))
 
-    final_dir = args.output_dir / "final"
-    best_dir = args.output_dir / "checkpoint-best"
-    print(f"训练结束：最近一轮权重在 {final_dir}（与 checkpoint-epoch{epoch} 一致）")
-    if best_val_epoch is not None:
+            primary_name = Path(dataset_roots[0]).name if dataset_roots else None
+            print(f"Epoch: [{epoch}]")
+            print(format_epoch_metric_line("Train", map_train, loss=train_loss))
+            for src in val_eval_sources:
+                m = map_val_per[src.name]
+                tag = f"{src.name}(本数据集)" if src.name == primary_name else src.name
+                print(format_epoch_metric_line(f"Val {tag}:", m))
+            if len(val_eval_sources) > 1:
+                print(format_epoch_metric_line("Val mean:", map_val_mean))
+
+            save_dir = args.output_dir / f"checkpoint-epoch{epoch}"
+            metrics = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_loss_cls_weighted": train_loss_cls,
+                "train_loss_bbox_l1_weighted": train_loss_l1_bbox,
+                "train_loss_giou_weighted": train_loss_giou,
+                "train_map": map_train,
+                "val_map": map_val,
+                "val_map_per_dataset": map_val_per,
+                "val_map_mean": map_val_mean if len(val_eval_sources) > 1 else None,
+                "train_mode": args.train_mode,
+                "unfreeze_backbone_last_n": args.unfreeze_backbone_last_n,
+                "warmup_epochs": args.warmup_epochs,
+                "backbone_warmup_mult": m_warm,
+                "pretrained": args.pretrained,
+                "load_source": load_source,
+                "dataset_roots": dataset_roots,
+                "num_labels": category_spec.num_labels,
+                "id2label": {str(k): v for k, v in category_spec.id2label.items()},
+                "coco_id_to_label": {str(k): v for k, v in category_spec.coco_id_to_label.items()},
+                "dataset_ratios": list(args.dataset_ratios) if args.dataset_ratios else None,
+                "train_sample_weights_enabled": train_sample_weights is not None,
+                "merged_coco_cache": str(merged_coco_cache) if merged_coco_cache is not None else None,
+                "optimizer": {
+                    "layerwise_dinov3_backbone_lr": used_layerwise,
+                    "lr": args.lr,
+                    "lr_backbone": lr_backbone_eff if used_layerwise else None,
+                    "backbone_lr_decay": args.backbone_lr_decay if used_layerwise else None,
+                    "weight_decay": args.weight_decay,
+                    "param_groups": len(param_groups),
+                },
+                "augmentation": augmentation_metrics_block(
+                    args.aug_level,
+                    simple_flip_p=args.aug_simple_flip_p,
+                    simple_color_p=args.aug_simple_color_p,
+                    det_photometric_p=args.aug_det_photometric_p,
+                    det_zoomout_fill=args.aug_det_zoomout_fill,
+                    det_zoomout_p=args.aug_det_zoomout_p,
+                    det_iou_crop_p=args.aug_det_iou_crop_p,
+                    det_flip_p=args.aug_det_flip_p,
+                    mosaic_p=args.aug_det_mosaic_p,
+                ),
+                "loss_weights": {
+                    "mal": model.config.weight_loss_mal,
+                    "bbox": model.config.weight_loss_bbox,
+                    "giou": model.config.weight_loss_giou,
+                    "fgl": model.config.weight_loss_fgl,
+                    "ddf": model.config.weight_loss_ddf,
+                },
+            }
+            _save_epoch_checkpoint(
+                save_dir,
+                model=model,
+                processor=processor,
+                metrics=metrics,
+                opt=opt,
+                epoch=epoch,
+                unfreeze_backbone_last_n=args.unfreeze_backbone_last_n,
+                warmup_epochs=args.warmup_epochs,
+                pretrained=args.pretrained,
+                load_source=load_source,
+            )
+            _promote_checkpoint_dir(save_dir, args.output_dir / "final")
+
+            val_bbox_map = _val_bbox_map(map_val if isinstance(map_val, dict) else None)
+            if val_bbox_map is not None and (
+                best_val_bbox_map is None or val_bbox_map >= best_val_bbox_map
+            ):
+                best_val_bbox_map = val_bbox_map
+                best_val_epoch = epoch
+                best_dir = args.output_dir / "checkpoint-best"
+                _promote_checkpoint_dir(save_dir, best_dir)
+                print(
+                    f"  新最佳 val bbox mAP={val_bbox_map:.4f}，已保存到 {best_dir.name}/"
+                )
+
+            if session_record["epochs"]["completed_from"] is None:
+                session_record["epochs"]["completed_from"] = epoch
+            session_record["epochs"]["completed_to"] = epoch
+            if best_val_epoch == epoch:
+                session_record["best"] = build_best_summary(
+                    epoch=best_val_epoch,
+                    val_bbox_map=best_val_bbox_map,
+                    metrics=metrics,
+                )
+            elif session_record.get("best") is None or (
+                isinstance(session_record.get("best"), dict)
+                and session_record["best"].get("epoch") != best_val_epoch
+            ):
+                session_record["best"] = build_best_summary(
+                    epoch=best_val_epoch,
+                    val_bbox_map=best_val_bbox_map,
+                )
+            _flush_run_record(status="running")
+
+        final_dir = args.output_dir / "final"
+        best_dir = args.output_dir / "checkpoint-best"
+        print(f"训练结束：最近一轮权重在 {final_dir}（与 checkpoint-epoch{epoch} 一致）")
+        if best_val_epoch is not None:
+            print(
+                f"验证集最佳: epoch {best_val_epoch}, val bbox mAP={best_val_bbox_map:.4f} -> {best_dir}"
+            )
+        else:
+            print("未记录 checkpoint-best（本轮无有效 val bbox mAP）")
+        _flush_run_record(status="completed")
         print(
-            f"验证集最佳: epoch {best_val_epoch}, val bbox mAP={best_val_bbox_map:.4f} -> {best_dir}"
+            f"训练过程记录已追加会话 #{session_record.get('session_index', '?')} → "
+            f"{args.output_dir / 'training_run.json'}（共 {len(run_record['sessions'])} 段）"
         )
-    else:
-        print("未记录 checkpoint-best（本轮无有效 val bbox mAP）")
+    except KeyboardInterrupt:
+        _flush_run_record(status="interrupted")
+        print(
+            f"\n训练中断，会话 #{session_record.get('session_index', '?')} 已写入: "
+            f"{args.output_dir / 'training_run.json'}"
+        )
+        raise
 
 
 if __name__ == "__main__":

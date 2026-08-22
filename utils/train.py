@@ -45,7 +45,7 @@ from torchvision.transforms import functional as TVF
 from torchvision.transforms import v2
 from transformers import Deimv2ForObjectDetection
 
-from utils.common import PROJECT_ROOT
+from utils.common import HF_DEIMV2_PRESETS, PROJECT_ROOT, resolve_pretrained_hub_id
 from configs import preprocess as pc
 from utils.preprocess import (
     letterbox_inverse_xyxy,
@@ -185,63 +185,97 @@ def augmentation_metrics_block(
     det_flip_p: float,
     mosaic_p: float,
 ) -> dict[str, Any]:
+    """仅记录本轮实际生效的增强（不含未使用档位的原始默认项）。"""
     level = parse_aug_level(level)
     mode = aug_mode_for_level(level)
-    eff_mosaic_p = resolve_train_mosaic_p(level, mosaic_p=mosaic_p)
-    det_eff = (
-        resolve_detection_params(
-            level,
-            photometric_p=det_photometric_p,
-            zoomout_fill=det_zoomout_fill,
-            zoomout_p=det_zoomout_p,
-            iou_crop_p=det_iou_crop_p,
-            flip_p=det_flip_p,
-        )
-        if uses_detection_pipeline(level)
-        else None
-    )
     block: dict[str, Any] = {
         "level": level,
         "preset": mode,
         "summary": LEVEL_SUMMARY[level],
-        "detection_strength": detection_strength(level) if det_eff else None,
-        "simple": {
-            "flip_p": simple_flip_p,
-            "color_p": simple_color_p,
-            "color_jitter": SIMPLE_COLOR_JITTER,
-        },
-        "detection": {
-            "photometric_p": det_eff.photometric_p if det_eff else det_photometric_p,
-            "photometric_magnitude": det_eff.photometric_magnitude if det_eff else None,
-            "zoomout_fill": det_zoomout_fill,
-            "zoomout_p": det_eff.zoomout_p if det_eff else det_zoomout_p,
-            "iou_crop_p": det_eff.iou_crop_p if det_eff else det_iou_crop_p,
-            "flip_p": det_eff.flip_p if det_eff else det_flip_p,
-            "mosaic_p": eff_mosaic_p,
-            "pipeline_fixed": list(DETECTION_PIPELINE_FIXED),
-            "mosaic_note": MOSAIC_FIXED if uses_mosaic(level) and eff_mosaic_p > 0 else None,
-        },
     }
     if level == 1:
-        block["active_params"] = []
-    elif level == 2:
-        block["active_params"] = {
-            "flip_p": simple_flip_p,
-            "color_p": simple_color_p,
+        return block
+    if level == 2:
+        block["simple"] = {
+            "flip_p": float(simple_flip_p),
+            "color_p": float(simple_color_p),
+            "color_jitter": SIMPLE_COLOR_JITTER,
         }
-    else:
-        assert det_eff is not None
-        block["active_params"] = {
-            "strength": detection_strength(level),
-            "photometric_p": det_eff.photometric_p,
-            "photometric_magnitude": det_eff.photometric_magnitude,
-            "zoomout_fill": det_zoomout_fill,
-            "zoomout_p": det_eff.zoomout_p,
-            "iou_crop_p": det_eff.iou_crop_p,
-            "flip_p": det_eff.flip_p,
-            "mosaic_p": eff_mosaic_p,
-        }
+        return block
+
+    det_eff = resolve_detection_params(
+        level,
+        photometric_p=det_photometric_p,
+        zoomout_fill=det_zoomout_fill,
+        zoomout_p=det_zoomout_p,
+        iou_crop_p=det_iou_crop_p,
+        flip_p=det_flip_p,
+    )
+    eff_mosaic_p = resolve_train_mosaic_p(level, mosaic_p=mosaic_p)
+    block["detection_strength"] = detection_strength(level)
+    block["detection"] = {
+        "photometric_p": det_eff.photometric_p,
+        "photometric_magnitude": det_eff.photometric_magnitude,
+        "zoomout_fill": float(det_zoomout_fill),
+        "zoomout_p": det_eff.zoomout_p,
+        "iou_crop_p": det_eff.iou_crop_p,
+        "flip_p": det_eff.flip_p,
+        "mosaic_p": eff_mosaic_p,
+        "pipeline_fixed": list(DETECTION_PIPELINE_FIXED),
+        "mosaic_note": MOSAIC_FIXED if uses_mosaic(level) and eff_mosaic_p > 0 else None,
+    }
     return block
+
+
+def slim_augmentation_block(aug: dict[str, Any] | None) -> dict[str, Any] | None:
+    """将旧版 augmentation（含未用档位 / active_params）收成仅最终生效结构。"""
+    if not isinstance(aug, dict):
+        return aug
+    try:
+        level = parse_aug_level(aug.get("level", aug.get("preset", 1)))
+    except (TypeError, ValueError):
+        return dict(aug)
+
+    out: dict[str, Any] = {
+        "level": level,
+        "preset": aug.get("preset") or aug_mode_for_level(level),
+        "summary": aug.get("summary") or LEVEL_SUMMARY.get(level, ""),
+    }
+    if level == 1:
+        return out
+    if level == 2:
+        simple = aug.get("simple")
+        if not isinstance(simple, dict):
+            active = aug.get("active_params") if isinstance(aug.get("active_params"), dict) else {}
+            simple = {
+                "flip_p": active.get("flip_p"),
+                "color_p": active.get("color_p"),
+                "color_jitter": SIMPLE_COLOR_JITTER,
+            }
+        out["simple"] = {
+            "flip_p": simple.get("flip_p"),
+            "color_p": simple.get("color_p"),
+            "color_jitter": simple.get("color_jitter", SIMPLE_COLOR_JITTER),
+        }
+        return out
+
+    det = aug.get("detection") if isinstance(aug.get("detection"), dict) else {}
+    active = aug.get("active_params") if isinstance(aug.get("active_params"), dict) else {}
+    out["detection_strength"] = aug.get("detection_strength", active.get("strength"))
+    out["detection"] = {
+        "photometric_p": det.get("photometric_p", active.get("photometric_p")),
+        "photometric_magnitude": det.get(
+            "photometric_magnitude", active.get("photometric_magnitude")
+        ),
+        "zoomout_fill": det.get("zoomout_fill", active.get("zoomout_fill")),
+        "zoomout_p": det.get("zoomout_p", active.get("zoomout_p")),
+        "iou_crop_p": det.get("iou_crop_p", active.get("iou_crop_p")),
+        "flip_p": det.get("flip_p", active.get("flip_p")),
+        "mosaic_p": det.get("mosaic_p", active.get("mosaic_p")),
+        "pipeline_fixed": det.get("pipeline_fixed", list(DETECTION_PIPELINE_FIXED)),
+        "mosaic_note": det.get("mosaic_note"),
+    }
+    return out
 
 
 def _fmt_p(v: object) -> str:
@@ -263,7 +297,10 @@ def _aug_params(aug: dict) -> dict:
     if level == 2:
         return aug.get("simple") or {}
     if level is not None and int(level) >= 3:
-        return aug.get("detection") or {}
+        det = aug.get("detection") or {}
+        if "strength" not in det and aug.get("detection_strength") is not None:
+            return {**det, "strength": aug["detection_strength"]}
+        return det
     preset = aug.get("preset")
     if preset == "simple":
         return aug.get("simple") or {}
@@ -272,7 +309,20 @@ def _aug_params(aug: dict) -> dict:
     return {}
 
 
+def _aug_level_label(level: int | str, strength: object | None = None) -> str:
+    """等级文案；strength 为已乘到各概率上的系数（如 0.75 → 75%强度）。"""
+    try:
+        lv = int(level)
+    except (TypeError, ValueError):
+        return f"等级{level}"
+    if isinstance(strength, (int, float)) and lv >= 3:
+        pct = int(round(float(strength) * 100))
+        return f"等级{lv}（{pct}%强度）"
+    return f"等级{lv}"
+
+
 def format_augmentation_summary(aug: dict | None) -> list[str]:
+    """摘要中的概率均为最终生效值（等级 3–5 已含强度系数）。"""
     if not aug:
         return ["数据增强: —"]
 
@@ -283,7 +333,7 @@ def format_augmentation_summary(aug: dict | None) -> list[str]:
         except ValueError:
             level = "?"
     if level == 1:
-        return [f"数据增强[L{level}]"]
+        return [f"数据增强: {_aug_level_label(level)}"]
 
     params = _aug_params(aug)
     lv = int(level) if isinstance(level, int) else level
@@ -293,21 +343,21 @@ def format_augmentation_summary(aug: dict | None) -> list[str]:
             f"HFlip {_fmt_p(params.get('flip_p', '—'))}",
             f"ColorJitter {_fmt_p(params.get('color_p', '—'))}",
         ]
-        return [f"数据增强[L{lv}]: {', '.join(parts)}"]
+        return [f"数据增强: {_aug_level_label(lv)}: {', '.join(parts)}"]
 
     if isinstance(lv, int) and lv >= 3:
-        strength = params.get("strength", params.get("photometric_magnitude", "—"))
+        strength = params.get("strength", aug.get("detection_strength", params.get("photometric_magnitude")))
+        # 下列概率均为乘强度后的最终值
         parts = [
-            f"强度×{_fmt_p(strength)}",
             f"Photometric {_fmt_p(params.get('photometric_p', '—'))}",
             f"ZoomOut {_fmt_p(params.get('zoomout_p', '—'))}",
             f"IoUCrop {_fmt_p(params.get('iou_crop_p', '—'))}",
             f"HFlip {_fmt_p(params.get('flip_p', '—'))}",
             f"Mosaic {_fmt_p(params.get('mosaic_p', '—'))}",
         ]
-        return [f"数据增强[L{lv}]: {', '.join(parts)}"]
+        return [f"数据增强: {_aug_level_label(lv, strength)}: {', '.join(parts)}"]
 
-    return [f"数据增强[{level}]"]
+    return [f"数据增强: {_aug_level_label(level)}"]
 
 
 def format_augmentation_log_line(aug: dict) -> str:
@@ -328,16 +378,21 @@ def resolve_cli_path(path: Path, *, script_dir: Path | None = None) -> Path:
 
 
 def _default_coco_train_val_paths(root: Path) -> tuple[Path, Path]:
-    """返回 (train_ann, val_ann)。支持 LabelMe 风格 train.json/val.json 或 COCO instances_*.json。"""
+    """返回 (train_ann, val_ann)。支持 LabelMe 风格 train.json/val.json（或 valid.json）或 COCO instances_*.json。"""
     ann = root / "annotations"
-    a1, b1 = ann / "train.json", ann / "val.json"
-    if a1.is_file() and b1.is_file():
-        return a1, b1
+    a1 = ann / "train.json"
+    for val_name in ("val.json", "valid.json"):
+        b1 = ann / val_name
+        if a1.is_file() and b1.is_file():
+            return a1, b1
     a2, b2 = ann / "instances_train.json", ann / "instances_val.json"
     if a2.is_file() and b2.is_file():
         return a2, b2
+    b2b = ann / "instances_valid.json"
+    if a2.is_file() and b2b.is_file():
+        return a2, b2b
     raise FileNotFoundError(
-        f"在 {ann} 下未找到 train.json+val.json 或 instances_train.json+instances_val.json（数据集根: {root}）"
+        f"在 {ann} 下未找到 train.json+(val|valid).json 或 instances_train.json+instances_val.json（数据集根: {root}）"
     )
 
 
@@ -439,11 +494,66 @@ def _remap_target_category_ids(target: list, category_id_remap: dict[int, int]) 
     return out
 
 
-def _abs_image_file_name(root: Path, file_name: str) -> str:
-    p = Path(file_name)
-    if p.is_absolute():
-        return str(p.resolve())
-    return str((root / file_name).resolve())
+def _abs_image_file_name(root: Path, file_name: str, *, split: str) -> str:
+    """将标注中的 file_name 解析为绝对路径（优先 images/{split}/）。"""
+    return str(resolve_dataset_image_path(root, file_name, split=split))
+
+
+def resolve_dataset_image_path(root: Path, file_name: str, *, split: str) -> Path:
+    """在数据集根目录下解析图片路径。
+
+    保留 images/ 为逻辑根；加载时优先 images/{split}/（val 亦尝试 valid/），
+    并兼容扁平 images/、标注内相对路径，以及已是绝对路径的 file_name。
+    """
+    fn_path = Path(file_name)
+    if fn_path.is_absolute() and fn_path.exists():
+        return fn_path.resolve()
+
+    image_dir = root / "images"
+    name = fn_path.name
+    split_key = str(split).strip().lower() or "train"
+    candidates: list[Path] = []
+
+    split_dirs = [image_dir / split_key]
+    if split_key == "val":
+        split_dirs.append(image_dir / "valid")
+    for sd in split_dirs:
+        candidates.append(sd / file_name)
+        candidates.append(sd / name)
+
+    candidates.append(image_dir / file_name)
+    candidates.append(image_dir / name)
+    if len(fn_path.parts) > 1 and fn_path.parts[0].lower() in {"images", "image"}:
+        candidates.append(image_dir / Path(*fn_path.parts[1:]))
+    # 旧行为：CocoDetection(root, ann) → root / file_name
+    candidates.append(root / file_name)
+    if fn_path.is_absolute():
+        candidates.insert(0, fn_path)
+
+    for path in candidates:
+        if path.exists():
+            return path.resolve()
+
+    search_dirs = list(split_dirs) + [image_dir, root]
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        matches = list(d.rglob(name))
+        if matches:
+            return matches[0].resolve()
+
+    raise FileNotFoundError(
+        f"找不到图片：{file_name}，数据集根：{root}，split={split_key}"
+    )
+
+
+def _infer_split_from_ann(ann_file: Path) -> str:
+    stem = ann_file.stem.lower()
+    if "train" in stem:
+        return "train"
+    if "val" in stem or "valid" in stem:
+        return "val"
+    return "train"
 
 
 def _resolve_dataset_ratios(ratios: list[float] | None, n_roots: int) -> list[float] | None:
@@ -521,7 +631,7 @@ def merge_coco_roots_for_training(
                 fn = img.get("file_name")
                 if not fn:
                     raise ValueError(f"image id={old_iid} 缺少 file_name（{ann_path}）")
-                new_img["file_name"] = _abs_image_file_name(root, str(fn))
+                new_img["file_name"] = _abs_image_file_name(root, str(fn), split=split_key)
                 imgs_this_root.append(new_img)
 
             images_out.extend(imgs_this_root)
@@ -871,8 +981,12 @@ class TeaCocoDataset(torch.utils.data.Dataset):
         mosaic_p: float = 0.0,
         sample_weights: list[float] | None = None,
         category_id_remap: dict[int, int] | None = None,
+        split: str | None = None,
     ):
-        self._coco = CocoDetection(str(root), str(ann_file))
+        self._root = Path(root)
+        self._ann_file = Path(ann_file)
+        self._split = split or _infer_split_from_ann(self._ann_file)
+        self._coco = CocoDetection(str(self._root), str(self._ann_file))
         self.mosaic_p = float(mosaic_p)
         self.sample_weights = sample_weights
         self._category_id_remap = category_id_remap or {}
@@ -883,14 +997,22 @@ class TeaCocoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._coco)
 
+    def _load_coco_item(self, idx: int) -> tuple[Image.Image, list]:
+        image_id = self._coco.ids[idx]
+        info = self._coco.coco.loadImgs(image_id)[0]
+        path = resolve_dataset_image_path(
+            self._root, str(info["file_name"]), split=self._split
+        )
+        img = Image.open(path).convert("RGB")
+        target = self._coco.coco.loadAnns(self._coco.coco.getAnnIds(imgIds=image_id))
+        return img, list(target)
+
     def __getitem__(self, idx: int):
         if self.mosaic_p > 0.0 and len(self._coco) >= 4 and torch.rand(()).item() < self.mosaic_p:
             return self._getitem_mosaic(idx)
-        img, target = self._coco[idx]
-        if img.mode != "RGB":
-            img = img.convert("RGB")
+        img, target = self._load_coco_item(idx)
         image_id = self._coco.ids[idx]
-        return img, image_id, self._remap_target(list(target))
+        return img, image_id, self._remap_target(target)
 
     def _getitem_mosaic(self, idx: int) -> tuple[Image.Image, int, list]:
         n = len(self._coco)
@@ -904,18 +1026,14 @@ class TeaCocoDataset(torch.utils.data.Dataset):
                 if len(others) == 3:
                     break
         if len(others) < 3:
-            img, target = self._coco[idx]
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            return img, self._coco.ids[idx], self._remap_target(list(target))
+            img, target = self._load_coco_item(idx)
+            return img, self._coco.ids[idx], self._remap_target(target)
 
         idxs = [idx, others[0], others[1], others[2]]
         quads: list[tuple[Image.Image, list]] = []
         for j in idxs:
-            img, target = self._coco[j]
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            quads.append((img, list(target)))
+            img, target = self._load_coco_item(j)
+            quads.append((img, target))
         mos_img, mos_tgt = _mosaic_pil_coco_quadrants(quads)
         return mos_img, self._coco.ids[idx], self._remap_target(mos_tgt)
 
@@ -1342,7 +1460,6 @@ def evaluate_coco_bbox_map(
     coco_gt: COCO,
     device: torch.device,
     batch_size: int,
-    score_threshold: float,
     num_workers: int,
     *,
     label_to_coco_id: dict[int, int] | None = None,
@@ -1366,7 +1483,7 @@ def evaluate_coco_bbox_map(
             kwargs["pixel_mask"] = enc["pixel_mask"].to(device)
         outputs = model(**kwargs)
         results = processor.post_process_object_detection(
-            outputs, threshold=score_threshold, target_sizes=target_sizes
+            outputs, threshold=0.0, target_sizes=target_sizes
         )
         for img_id, res, meta in zip(image_ids, results, lb_meta):
             scores = res["scores"]
@@ -1429,15 +1546,100 @@ def evaluate_coco_bbox_map(
         coco_eval.summarize()
 
     s = coco_eval.stats
+    acc = compute_detection_accuracy(predictions, coco_gt, iou_thr=0.5, score_thr=0.5)
     return {
         "bbox_mAP": float(s[0]),
         "bbox_mAP_50": float(s[1]),
         "bbox_mAP_75": float(s[2]),
         "bbox_mAR_100": float(s[8]),
+        "bbox_acc_50": float(acc),
     }
 
 
-_MAP_METRIC_KEYS = ("bbox_mAP", "bbox_mAP_50", "bbox_mAP_75", "bbox_mAR_100")
+_MAP_METRIC_KEYS = (
+    "bbox_mAP",
+    "bbox_mAP_50",
+    "bbox_mAP_75",
+    "bbox_mAR_100",
+    "bbox_acc_50",
+)
+
+
+def _xywh_to_xyxy_list(bbox: list[float] | tuple[float, ...]) -> list[float]:
+    x, y, w, h = (float(v) for v in bbox)
+    return [x, y, x + w, y + h]
+
+
+def compute_detection_accuracy(
+    predictions: list[dict],
+    coco_gt: COCO,
+    *,
+    iou_thr: float = 0.5,
+    score_thr: float = 0.5,
+) -> float:
+    """检测 Accuracy @ IoU：TP / (TP+FP+FN)，按 score 贪心匹配。"""
+    from torchvision.ops import box_iou
+
+    preds_by_img: dict[int, list[dict]] = defaultdict(list)
+    for p in predictions:
+        if float(p["score"]) < score_thr:
+            continue
+        preds_by_img[int(p["image_id"])].append(p)
+
+    img_ids = list(coco_gt.getImgIds())
+    tp = fp = fn = 0
+    for img_id in img_ids:
+        ann_ids = coco_gt.getAnnIds(imgIds=[img_id], iscrowd=None)
+        gts = [a for a in coco_gt.loadAnns(ann_ids) if int(a.get("iscrowd", 0)) == 0]
+        preds = sorted(preds_by_img.get(img_id, []), key=lambda x: float(x["score"]), reverse=True)
+        if not gts and not preds:
+            continue
+        if not gts:
+            fp += len(preds)
+            continue
+        if not preds:
+            fn += len(gts)
+            continue
+        gt_boxes = torch.tensor([_xywh_to_xyxy_list(g["bbox"]) for g in gts], dtype=torch.float32)
+        pred_boxes = torch.tensor([_xywh_to_xyxy_list(p["bbox"]) for p in preds], dtype=torch.float32)
+        ious = box_iou(pred_boxes, gt_boxes)
+        gt_used = [False] * len(gts)
+        for i in range(len(preds)):
+            best_j = int(torch.argmax(ious[i]).item())
+            best_iou = float(ious[i, best_j].item())
+            if best_iou >= iou_thr and not gt_used[best_j]:
+                # 单类任务以定位匹配计；多类时要求 category 一致
+                if int(preds[i]["category_id"]) == int(gts[best_j]["category_id"]):
+                    tp += 1
+                    gt_used[best_j] = True
+                    ious[:, best_j] = -1.0
+                    continue
+            fp += 1
+        fn += sum(1 for u in gt_used if not u)
+    denom = tp + fp + fn
+    return float(tp / denom) if denom > 0 else 0.0
+
+
+def format_epoch_metric_line(
+    label: str,
+    metrics: dict[str, float],
+    *,
+    loss: float | None = None,
+) -> str:
+    """统一的 epoch 指标行：可选 Loss + AP0.5/AP0.75/AP/AR/Accuracy。"""
+    parts: list[str] = []
+    if loss is not None:
+        parts.append(f"Loss={loss:.4f}")
+    parts.extend(
+        [
+            f"AP0.5={metrics['bbox_mAP_50']:.4f}",
+            f"AP0.75={metrics['bbox_mAP_75']:.4f}",
+            f"AP={metrics['bbox_mAP']:.4f}",
+            f"AR={metrics['bbox_mAR_100']:.4f}",
+            f"Accuracy={metrics.get('bbox_acc_50', 0.0):.4f}",
+        ]
+    )
+    return f"{label}  " + "  ".join(parts)
 
 
 def _mean_map_metrics(per_dataset: dict[str, dict[str, float]]) -> dict[str, float]:
@@ -1454,12 +1656,11 @@ def evaluate_val_maps_per_dataset(
     val_sources: list[ValEvalSource],
     device: torch.device,
     batch_size: int,
-    score_threshold: float,
     num_workers: int,
     *,
     label_to_coco_id: dict[int, int] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, float]]:
-    """对各数据集 val 分别评测，逐行打印，返回 (per_dataset, mean)。"""
+    """对各数据集 val 分别评测，返回 (per_dataset, mean)。不打印（由调用方统一排版）。"""
     per_ds: dict[str, dict[str, float]] = {}
     for src in val_sources:
         buf = StringIO()
@@ -1472,21 +1673,11 @@ def evaluate_val_maps_per_dataset(
             coco_gt,
             device,
             batch_size=batch_size,
-            score_threshold=score_threshold,
             num_workers=num_workers,
             label_to_coco_id=label_to_coco_id,
         )
         per_ds[src.name] = m
-        print(
-            f"  val [{src.name}] mAP={m['bbox_mAP']:.4f} mAP50={m['bbox_mAP_50']:.4f} "
-            f"mAP75={m['bbox_mAP_75']:.4f} AR100={m['bbox_mAR_100']:.4f}"
-        )
     mean_m = _mean_map_metrics(per_ds)
-    if len(per_ds) > 1:
-        print(
-            f"  val [mean] mAP={mean_m['bbox_mAP']:.4f} mAP50={mean_m['bbox_mAP_50']:.4f} "
-            f"mAP75={mean_m['bbox_mAP_75']:.4f} AR100={mean_m['bbox_mAR_100']:.4f}"
-        )
     return per_ds, mean_m
 
 
@@ -1540,8 +1731,228 @@ def _sum_weighted_giou_loss(loss_dict: dict | None) -> float:
 
 
 # ========================================================================
-# Train Checkpoint
+# Train Run Record (output_dir/training_run.json)
 # ========================================================================
+
+TRAINING_RUN_FILENAME = "training_run.json"
+TRAINING_RUN_SCHEMA_VERSION = 2
+_SESSION_TOP_KEYS = (
+    "status",
+    "started_at",
+    "updated_at",
+    "finished_at",
+    "command",
+    "preset",
+    "cli_overrides",
+    "effective",
+    "start_model",
+    "epochs",
+    "best",
+)
+
+_AUG_FLAT_EFFECTIVE_KEYS = frozenset(
+    {
+        "aug_level",
+        "aug_simple_flip_p",
+        "aug_simple_color_p",
+        "aug_det_photometric_p",
+        "aug_det_zoomout_fill",
+        "aug_det_zoomout_p",
+        "aug_det_iou_crop_p",
+        "aug_det_flip_p",
+        "aug_det_mosaic_p",
+    }
+)
+
+
+def json_safe(obj: Any) -> Any:
+    """将 Path / tuple 等转为可 JSON 序列化结构。"""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [json_safe(x) for x in obj]
+    return str(obj)
+
+
+def snapshot_preprocess_config() -> dict[str, Any]:
+    """configs/preprocess.py 当前生效值快照。"""
+    return {
+        "INPUT_SIZE": int(pc.INPUT_SIZE),
+        "RESIZE_MODE": str(pc.RESIZE_MODE),
+        "LETTERBOX_FILL_RGB": list(pc.LETTERBOX_FILL_RGB),
+        "DO_RESIZE": bool(pc.DO_RESIZE),
+        "DO_RESCALE": bool(pc.DO_RESCALE),
+        "DO_NORMALIZE": bool(pc.DO_NORMALIZE),
+        "IMAGE_MEAN": list(pc.IMAGE_MEAN),
+        "IMAGE_STD": list(pc.IMAGE_STD),
+        "USE_CHECKPOINT_PREPROCESSOR": bool(pc.USE_CHECKPOINT_PREPROCESSOR),
+        "FORCE_APPLY_CONFIG": bool(pc.FORCE_APPLY_CONFIG),
+    }
+
+
+def write_training_run_json(output_dir: Path, record: dict[str, Any]) -> Path:
+    """写入 output_dir/training_run.json（整文件覆盖；会话历史应已在 record['sessions'] 中）。"""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / TRAINING_RUN_FILENAME
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(json_safe(record), f, indent=2, ensure_ascii=False)
+    return path
+
+
+def load_training_run_json(output_dir: Path) -> dict[str, Any] | None:
+    path = output_dir / TRAINING_RUN_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _session_from_legacy_record(legacy: dict[str, Any]) -> dict[str, Any]:
+    """将 schema v1（无 sessions）整份记录收成一条 session。"""
+    session = {k: legacy[k] for k in _SESSION_TOP_KEYS if k in legacy}
+    if "status" not in session:
+        session["status"] = "completed"
+    return session
+
+
+def normalize_training_run_record(existing: dict[str, Any] | None) -> dict[str, Any]:
+    """加载已有记录并规范为 schema v2（含 sessions[]）。"""
+    if not existing:
+        return {
+            "schema_version": TRAINING_RUN_SCHEMA_VERSION,
+            "updated_at": None,
+            "status": None,
+            "best": None,
+            "sessions": [],
+        }
+
+    sessions = existing.get("sessions")
+    if isinstance(sessions, list):
+        fixed: list[dict[str, Any]] = []
+        for i, s in enumerate(sessions):
+            if isinstance(s, dict):
+                s = dict(s)
+                s.setdefault("session_index", i)
+                fixed.append(s)
+        out = {
+            "schema_version": TRAINING_RUN_SCHEMA_VERSION,
+            "updated_at": existing.get("updated_at"),
+            "status": existing.get("status"),
+            "best": existing.get("best"),
+            "sessions": fixed,
+        }
+        return out
+
+    # v1：顶层即单次会话
+    session = _session_from_legacy_record(existing)
+    if session:
+        session.setdefault("session_index", 0)
+    return {
+        "schema_version": TRAINING_RUN_SCHEMA_VERSION,
+        "updated_at": existing.get("updated_at") or existing.get("finished_at"),
+        "status": existing.get("status"),
+        "best": existing.get("best"),
+        "sessions": [session] if session else [],
+    }
+
+
+def better_best_summary(
+    a: dict[str, Any] | None, b: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """按 val_bbox_mAP 取更优的 best 摘要（相等时保留 epoch 更大者）。"""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    am = a.get("val_bbox_mAP")
+    bm = b.get("val_bbox_mAP")
+    if am is None:
+        return b
+    if bm is None:
+        return a
+    if float(bm) > float(am):
+        return b
+    if float(bm) < float(am):
+        return a
+    ae = int(a.get("epoch") or -1)
+    be = int(b.get("epoch") or -1)
+    return b if be >= ae else a
+
+
+def aggregate_best_from_sessions(sessions: list[dict[str, Any]]) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    for s in sessions:
+        if isinstance(s, dict):
+            best = better_best_summary(best, s.get("best") if isinstance(s.get("best"), dict) else None)
+    return best
+
+
+def begin_training_run_session(
+    output_dir: Path, session: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """加载已有 training_run.json，追加一条新 session，返回 (整份 record, 当前 session 引用)。"""
+    record = normalize_training_run_record(load_training_run_json(output_dir))
+    session = dict(session)
+    session.setdefault("session_index", len(record["sessions"]))
+    record["sessions"].append(session)
+    record["status"] = session.get("status")
+    record["updated_at"] = session.get("updated_at") or session.get("started_at")
+    record["best"] = aggregate_best_from_sessions(record["sessions"])
+    return record, record["sessions"][-1]
+
+
+def flush_training_run_session(
+    output_dir: Path,
+    record: dict[str, Any],
+    session: dict[str, Any],
+    *,
+    status: str | None = None,
+) -> Path:
+    """更新当前 session 与顶层汇总后写回。"""
+    now = session.get("updated_at")
+    if status is not None:
+        session["status"] = status
+    if status in ("completed", "already_done", "interrupted"):
+        session["finished_at"] = now or session.get("finished_at")
+    record["status"] = session.get("status")
+    record["updated_at"] = now or record.get("updated_at")
+    record["best"] = aggregate_best_from_sessions(record["sessions"])
+    record["schema_version"] = TRAINING_RUN_SCHEMA_VERSION
+    return write_training_run_json(output_dir, record)
+
+
+def build_best_summary(
+    *,
+    epoch: int | None,
+    val_bbox_map: float | None,
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if epoch is None or val_bbox_map is None:
+        return None
+    out: dict[str, Any] = {
+        "epoch": int(epoch),
+        "val_bbox_mAP": float(val_bbox_map),
+    }
+    if metrics:
+        for key in (
+            "val_map",
+            "val_map_mean",
+            "val_map_per_dataset",
+            "train_map",
+            "train_loss",
+        ):
+            if key in metrics and metrics[key] is not None:
+                out[key] = metrics[key]
+    return out
+
 
 def _load_training_state_path(resume_dir: Path) -> Path | None:
     p = resume_dir / "training_state.pt"
@@ -1868,6 +2279,7 @@ def _fmt_float(x: object, sci_threshold: float = 1e-3) -> str:
 
 
 def format_training_config(metrics: dict, run_name: str, epoch_first: int, epoch_last: int) -> str:
+    """旧回退：仅有 train_metrics、无 training_run.json 时使用。"""
     opt = metrics.get("optimizer") or {}
     aug = metrics.get("augmentation") or {}
     loss_w = metrics.get("loss_weights") or {}
@@ -1895,27 +2307,219 @@ def format_training_config(metrics: dict, run_name: str, epoch_first: int, epoch
 
     aug_lines = format_augmentation_summary(aug)
 
+    weight_name = "—"
+    if pretrained in HF_DEIMV2_PRESETS:
+        weight_name = resolve_pretrained_hub_id(str(pretrained)).split("/")[-1]
+    elif isinstance(metrics.get("load_source"), str) and "/" in str(metrics.get("load_source")):
+        src = str(metrics["load_source"])
+        if "checkpoint" not in src.lower():
+            weight_name = src.split("/")[-1]
+
     return "\n".join(
         [
             f"训练目录: {run_name}    epoch {epoch_first}–{epoch_last}",
+            f"骨架: {pretrained}    起点权重: {weight_name}",
             (
-                f"骨架: {pretrained}    模式: {metrics.get('train_mode', '—')}    "
-                f"解冻 backbone 末 {metrics.get('unfreeze_backbone_last_n', '—')} 层    "
+                f"训练模式: {metrics.get('train_mode', '—')}, "
+                f"解冻末 {metrics.get('unfreeze_backbone_last_n', '—')} 层, "
                 f"warmup_epochs={metrics.get('warmup_epochs', 0)}"
             ),
             f"优化器: {lr_part}    param_groups={opt.get('param_groups', '—')}",
             f"训练数据: {data_part}",
             *aug_lines,
             (
-                f"mAP score_thr={metrics.get('map_score_threshold', '—')}    "
-                f"初始模型权重: {_path_basename(metrics.get('load_source'))}"
-            ),
-            (
                 f"loss 权重: mal={loss_w.get('mal', '—')}, bbox={loss_w.get('bbox', '—')}, "
                 f"giou={loss_w.get('giou', '—')}, fgl={loss_w.get('fgl', '—')}, ddf={loss_w.get('ddf', '—')}"
             ),
         ]
     )
+
+
+def _session_epoch_span(session: dict[str, Any]) -> tuple[int, int] | None:
+    ep = session.get("epochs") if isinstance(session.get("epochs"), dict) else {}
+    a = ep.get("completed_from", ep.get("from"))
+    b = ep.get("completed_to", ep.get("to"))
+    if a is None or b is None:
+        return None
+    try:
+        return int(a), int(b)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stable_value_key(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _merge_adjacent_segments(
+    segments: list[tuple[tuple[int, int], str]],
+) -> list[tuple[tuple[int, int], str]]:
+    """相邻且文案相同的段合并 epoch 区间。"""
+    if not segments:
+        return []
+    merged: list[tuple[tuple[int, int], str]] = []
+    (a, b), text = segments[0]
+    for (na, nb), ntext in segments[1:]:
+        if _stable_value_key(ntext) == _stable_value_key(text) and na <= b + 1:
+            b = max(b, nb)
+            continue
+        merged.append(((a, b), text))
+        a, b, text = na, nb, ntext
+    merged.append(((a, b), text))
+    return merged
+
+
+def _format_segmented_setting(
+    label: str,
+    segments: list[tuple[tuple[int, int], str]],
+) -> str:
+    """segments: [((ep_a, ep_b), display_text), ...]。有变化则按 epoch 段列出。"""
+    if not segments:
+        return f"{label}: —"
+    segments = _merge_adjacent_segments(segments)
+    keys = [_stable_value_key(text) for _, text in segments]
+    if len(set(keys)) <= 1:
+        return f"{label}: {segments[0][1]}"
+    # 用空格代替 \t：matplotlib 中文字体通常无 tab 字形
+    indent = " " * 4
+    parts = [f"{indent}epoch {a}–{b}: {text}" for (a, b), text in segments]
+    return f"{label}:\n" + "\n".join(parts)
+
+
+def _eff_aug_display(eff: dict[str, Any]) -> str:
+    lines = format_augmentation_summary(eff.get("augmentation") if isinstance(eff, dict) else None)
+    if not lines:
+        return "—"
+    text = lines[0]
+    # 「数据增强: 等级4（75%强度）: Photometric …」→ 去掉前缀「数据增强: 」
+    prefix = "数据增强:"
+    if text.startswith(prefix):
+        return text[len(prefix) :].strip()
+    return text
+
+
+def _resolve_deimv2_weight_name(sessions: list[dict[str, Any]]) -> str:
+    """图注用的 DEIMv2 预训练权重短名（如 deimv2-deimv2_dinov3_l_coco）。"""
+    for s in sessions:
+        sm = s.get("start_model") if isinstance(s.get("start_model"), dict) else {}
+        eff = s.get("effective") if isinstance(s.get("effective"), dict) else {}
+        hub = sm.get("hub_id")
+        if isinstance(hub, str) and hub.strip():
+            return hub.split("/")[-1]
+        pretrained = eff.get("pretrained") or sm.get("pretrained")
+        if isinstance(pretrained, str) and pretrained in HF_DEIMV2_PRESETS:
+            return resolve_pretrained_hub_id(pretrained).split("/")[-1]
+        src = sm.get("load_source")
+        if isinstance(src, str) and "/" in src and "checkpoint" not in src.lower():
+            return src.split("/")[-1]
+    return "—"
+
+
+def _eff_optimizer_display(eff: dict[str, Any]) -> str:
+    lr = eff.get("lr")
+    lr_bb = eff.get("lr_backbone")
+    decay = eff.get("backbone_lr_decay")
+    wd = eff.get("weight_decay")
+    part = f"lr={_fmt_float(lr)}"
+    if eff.get("optimizer_layerwise_dinov3_backbone_lr") and lr_bb is not None:
+        part += f", lr_backbone={_fmt_float(lr_bb)}, decay={decay if decay is not None else '—'}"
+    part += f", wd={_fmt_float(wd)}"
+    return part
+
+
+def _eff_mode_display(eff: dict[str, Any]) -> str:
+    return (
+        f"{eff.get('train_mode', '—')}, "
+        f"解冻末 {eff.get('unfreeze_backbone_last_n', '—')} 层, "
+        f"warmup_epochs={eff.get('warmup_epochs', 0)}"
+    )
+
+
+def _eff_data_display(eff: dict[str, Any]) -> str:
+    roots = eff.get("dataset_roots") or eff.get("datasets")
+    if isinstance(roots, list) and roots:
+        data_part = " + ".join(_path_basename(r) for r in roots)
+    else:
+        data_part = "—"
+    ratios = eff.get("dataset_ratios")
+    if isinstance(ratios, list) and ratios:
+        data_part += f"  ratios={ratios}"
+    return data_part
+
+
+def _eff_loss_display(eff: dict[str, Any]) -> str:
+    loss_w = eff.get("loss_weights") if isinstance(eff.get("loss_weights"), dict) else {}
+    return (
+        f"mal={loss_w.get('mal', '—')}, bbox={loss_w.get('bbox', '—')}, "
+        f"giou={loss_w.get('giou', '—')}, fgl={loss_w.get('fgl', '—')}, ddf={loss_w.get('ddf', '—')}"
+    )
+
+
+def _eff_start_model_display(session: dict[str, Any], eff: dict[str, Any]) -> str:
+    sm = session.get("start_model") if isinstance(session.get("start_model"), dict) else {}
+    src = sm.get("load_source") or sm.get("resume_from") or eff.get("resume_from") or sm.get("pretrained")
+    name = sm.get("name") or _path_basename(src)
+    src_base = _path_basename(src)
+    if not src_base or src_base == "—":
+        return str(name or "—")
+    if str(name) == str(src_base):
+        return str(src_base)
+    return f"{name} ← {src_base}"
+
+
+def format_training_config_from_run(
+    run_dir: Path,
+    run_name: str,
+    epoch_first: int,
+    epoch_last: int,
+    *,
+    fallback_metrics: dict | None = None,
+) -> str:
+    """图注优先取自 output_dir/training_run.json；设定跨会话变化时按 epoch 段列出。"""
+    record = normalize_training_run_record(load_training_run_json(run_dir))
+    sessions = [
+        s
+        for s in record.get("sessions", [])
+        if isinstance(s, dict) and _session_epoch_span(s) is not None
+    ]
+    if not sessions:
+        if fallback_metrics:
+            return format_training_config(fallback_metrics, run_name, epoch_first, epoch_last)
+        return f"训练目录: {run_name}    epoch {epoch_first}–{epoch_last}\n（无 training_run.json）"
+
+    sessions = sorted(sessions, key=lambda s: _session_epoch_span(s) or (0, 0))
+
+    def segs(extractor) -> list[tuple[tuple[int, int], str]]:
+        out: list[tuple[tuple[int, int], str]] = []
+        for s in sessions:
+            span = _session_epoch_span(s)
+            if span is None:
+                continue
+            eff = s.get("effective") if isinstance(s.get("effective"), dict) else {}
+            out.append((span, extractor(s, eff)))
+        return out
+
+    pretrained_vals = []
+    for s in sessions:
+        eff = s.get("effective") if isinstance(s.get("effective"), dict) else {}
+        sm = s.get("start_model") if isinstance(s.get("start_model"), dict) else {}
+        pretrained_vals.append(str(eff.get("pretrained") or sm.get("pretrained") or "—"))
+    pretrained = pretrained_vals[0] if len(set(pretrained_vals)) == 1 else pretrained_vals[0]
+    weight_name = _resolve_deimv2_weight_name(sessions)
+
+    lines = [
+        f"训练目录: {run_name}    epoch {epoch_first}–{epoch_last}    训练段数={len(sessions)}",
+        f"骨架: {pretrained}    起点权重: {weight_name}",
+        _format_segmented_setting("训练模式", segs(lambda _s, eff: _eff_mode_display(eff))),
+        _format_segmented_setting("优化器", segs(lambda _s, eff: _eff_optimizer_display(eff))),
+        _format_segmented_setting("训练数据", segs(lambda _s, eff: _eff_data_display(eff))),
+        _format_segmented_setting("数据增强", segs(lambda _s, eff: _eff_aug_display(eff))),
+        _format_segmented_setting("loss 权重", segs(lambda _s, eff: _eff_loss_display(eff))),
+    ]
+    return "\n".join(lines)
 
 
 @dataclass
@@ -2169,7 +2773,15 @@ def plot_run(series: RunSeries, out_path: Path) -> None:
         raise ValueError(f"未找到 train_metrics.json: {series.run_dir}")
 
     use_markers = len(epochs) <= _MARKER_EPOCH_LIMIT
-    config_text = format_training_config(series.config, series.name, epochs[0], epochs[-1])
+    config_text = format_training_config_from_run(
+        series.run_dir,
+        series.name,
+        epochs[0],
+        epochs[-1],
+        fallback_metrics=series.config,
+    )
+    n_note_lines = max(1, config_text.count("\n") + 1)
+    bottom = min(0.40, 0.16 + 0.022 * n_note_lines)
 
     fig, axes = plt.subplots(3, 1, figsize=(11, 11), sharex=True)
     fig.suptitle(f"训练曲线 — {series.name}", fontsize=12, y=0.98)
@@ -2184,20 +2796,23 @@ def plot_run(series: RunSeries, out_path: Path) -> None:
     _plot_map_subplot(axes[2], epochs, series.map50, MAP50_SUBPLOT_TITLE, use_markers)
     axes[2].set_xlabel("epoch")
 
+    save_dpi = 150
+    # 相对图底上移 200px（按 savefig dpi 换算为 figure 坐标）
+    note_y = 0.01 + 200 / (fig.get_figheight() * save_dpi)
     fig.text(
-        0.5,
-        0.01,
+        0.02,
+        note_y,
         config_text,
-        ha="center",
+        ha="left",
         va="bottom",
-        fontsize=7.5,
-        linespacing=1.35,
+        fontsize=9.0,
+        linespacing=1.4,
         bbox=dict(boxstyle="round,pad=0.35", facecolor="#f7f7f7", edgecolor="#cccccc", alpha=0.95),
     )
 
-    fig.subplots_adjust(top=0.94, bottom=0.18, hspace=0.38)
+    fig.subplots_adjust(top=0.94, bottom=bottom, hspace=0.38)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
+    fig.savefig(out_path, dpi=save_dpi)
     plt.close(fig)
 
 

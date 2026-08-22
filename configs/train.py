@@ -12,13 +12,13 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 
 DATASETS: list[Path] = [
-    ROOT_DIR / "datasets" / "teabud_march_ztu",
+    ROOT_DIR / "datasets" / "2026pre_gy",
 ]
 DATASET_RATIOS: list[float] | None = None
-OUTPUT_DIR = ROOT_DIR / "outputs" / "deimv2_l"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "2026pre_gy"
 RESUME_FROM: Path | None = None
 
-EPOCHS = 100
+EPOCHS = 200
 BATCH_SIZE = 4
 NUM_WORKERS = 0
 
@@ -33,11 +33,10 @@ BACKBONE_LR_DECAY = 0.7
 WARMUP_EPOCHS = 0
 DEVICE: str | None = None
 
-MAP_SCORE_THRESHOLD = 0.05
 MAP_BATCH_SIZE: int | None = None
 
 # 数据增强等级 1–5（默认 5 = detection 全强度 + Mosaic）；细项概率默认见 configs/augmentation.py
-AUG_LEVEL = 5
+AUG_LEVEL = 4
 
 PRESETS: dict[str, dict] = {
     "dinov3_s_march": {

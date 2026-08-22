@@ -1,4 +1,4 @@
-# teaDetector
+# teabud-detect
 
 **Languages / 语言：** [简体中文](README.md) · [English](README.en.md)
 
@@ -51,7 +51,7 @@ pip install -r requirements.txt
 ## 目录结构（精简）
 
 ```
-teaDetector/
+teabud-detect/
 ├── configs/          # 训练 / 评测 / 预处理 / 导出 的默认参数
 ├── datasets/         # 各 COCO 数据集根目录，如 teabud_march_ztu、teabud_april
 ├── outputs/          # 训练 checkpoint、评测结果、曲线图
@@ -129,7 +129,8 @@ python train_tea.py `
 
 - `checkpoint-epochN/` — 每轮快照；`final/` 与最近一轮同步，便于中断后续训
 - `checkpoint-best/` — 验证集 bbox mAP 最高时保存
-- `train_metrics.json` — 损失与 mAP 记录，供 `plot_train_curves.py` 使用
+- `training_run.json` — 训练过程总览；`sessions[]` 按每次启动追加（config/CLI/epoch 起止/该段最佳），顶层 `best` 为全局最佳
+- `checkpoint-epochN/train_metrics.json` — 每轮损失与 mAP，供 `plot_train_curves.py` 使用
 
 ---
 

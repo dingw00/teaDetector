@@ -160,6 +160,37 @@ def resolve_pretrained_hub_id(pretrained: str) -> str:
     return HF_DEIMV2_PRESETS[pretrained]
 
 
+def from_pretrained_with_local_fallback(load_fn, model_id_or_path: str | Path, *args, **kwargs):
+    """调用 transformers 风格 from_pretrained。
+
+    对 Hub repo id：先试本地缓存（local_files_only），避免 SSL/网络抖动长时间重试；
+    缓存未命中时再走在线下载。
+    """
+    ident = as_pretrained_identifier(model_id_or_path)
+    if kwargs.get("local_files_only"):
+        return load_fn(ident, *args, **kwargs)
+
+    local = Path(ident)
+    if local.is_dir():
+        return load_fn(ident, *args, **kwargs)
+
+    try:
+        return load_fn(ident, *args, **kwargs, local_files_only=True)
+    except Exception as cache_exc:
+        print(f"提示: 本地缓存未命中 {ident}（{type(cache_exc).__name__}），改为在线下载…")
+
+    try:
+        return load_fn(ident, *args, **kwargs)
+    except Exception as online_exc:
+        raise RuntimeError(
+            f"无法从本地缓存或 HuggingFace Hub 加载 {ident!r}。\n"
+            f"  缓存错误: {type(cache_exc).__name__}: {cache_exc}\n"
+            f"  在线错误: {type(online_exc).__name__}: {online_exc}\n"
+            "可设置环境变量 HF_ENDPOINT=https://hf-mirror.com 后重试下载，"
+            "或确认 ~/.cache/huggingface/hub 中已有该模型。"
+        ) from online_exc
+
+
 def as_pretrained_identifier(path_or_id: str | Path) -> str:
     """传给 transformers.from_pretrained 的标识：本地路径 resolve；Hub repo id 保留 '/'。
 
